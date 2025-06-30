@@ -34,13 +34,6 @@
         <!-- AWS SDK v1 (more stable for Lambda) -->
         <dependency>
             <groupId>com.amazonaws</groupId>
-            <artifactId>aws-java-sdk-bedrockruntime</artifactId>
-            <version>1.12.565</version>
-        </dependency>
-
-        <!-- If above doesn't work, use core SDK and make HTTP calls -->
-        <dependency>
-            <groupId>com.amazonaws</groupId>
             <artifactId>aws-java-sdk-core</artifactId>
             <version>1.12.565</version>
         </dependency>
@@ -49,16 +42,6 @@
         <dependency>
             <groupId>com.fasterxml.jackson.core</groupId>
             <artifactId>jackson-databind</artifactId>
-            <version>2.15.2</version>
-        </dependency>
-        <dependency>
-            <groupId>com.fasterxml.jackson.core</groupId>
-            <artifactId>jackson-core</artifactId>
-            <version>2.15.2</version>
-        </dependency>
-        <dependency>
-            <groupId>com.fasterxml.jackson.core</groupId>
-            <artifactId>jackson-annotations</artifactId>
             <version>2.15.2</version>
         </dependency>
 
@@ -101,11 +84,6 @@
             <artifactId>mockito-core</artifactId>
             <version>5.3.1</version>
             <scope>test</scope>
-        </dependency>
-        <dependency>
-        	<groupId>com.somdiproy</groupId>
-        	<artifactId>smart-code-review</artifactId>
-        	<version>0.0.1-SNAPSHOT</version>
         </dependency>
     </dependencies>
 
