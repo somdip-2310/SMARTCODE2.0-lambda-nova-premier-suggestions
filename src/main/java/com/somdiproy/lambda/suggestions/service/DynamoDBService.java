@@ -169,19 +169,45 @@ public class DynamoDBService {
             Map<String, AttributeValue> item = new HashMap<>();
             item.put("analysisId", AttributeValue.builder().s(analysisId).build());
             item.put("issueId", AttributeValue.builder().s(suggestion.getIssueId()).build());
-            item.put("suggestion", AttributeValue.builder().s(objectMapper.writeValueAsString(suggestion)).build());
-            item.put("issueType", AttributeValue.builder().s(suggestion.getIssueType()).build());
-            item.put("severity", AttributeValue.builder().s(suggestion.getIssueSeverity()).build());
-            item.put("category", AttributeValue.builder().s(suggestion.getIssueCategory()).build());
-            item.put("language", AttributeValue.builder().s(suggestion.getLanguage()).build());
+            
+            // Store suggestion data in the format expected by main app
+            if (suggestion.getImmediateFix() != null) {
+                Map<String, AttributeValue> immediateFix = new HashMap<>();
+                immediateFix.put("title", AttributeValue.builder().s(
+                    suggestion.getImmediateFix().getTitle() != null ? 
+                    suggestion.getImmediateFix().getTitle() : "Fix Required").build());
+                immediateFix.put("searchCode", AttributeValue.builder().s(
+                    suggestion.getImmediateFix().getSearchCode() != null ? 
+                    suggestion.getImmediateFix().getSearchCode() : "Review code").build());
+                immediateFix.put("replaceCode", AttributeValue.builder().s(
+                    suggestion.getImmediateFix().getReplaceCode() != null ? 
+                    suggestion.getImmediateFix().getReplaceCode() : "Apply fix").build());
+                immediateFix.put("explanation", AttributeValue.builder().s(
+                    suggestion.getImmediateFix().getExplanation() != null ? 
+                    suggestion.getImmediateFix().getExplanation() : "Security fix required").build());
+                
+                item.put("suggestion", AttributeValue.builder().m(Map.of(
+                    "immediateFix", AttributeValue.builder().m(immediateFix).build()
+                )).build());
+            } else {
+                // Create basic fallback suggestion structure
+                Map<String, AttributeValue> basicFix = new HashMap<>();
+                basicFix.put("title", AttributeValue.builder().s("Manual Review Required").build());
+                basicFix.put("searchCode", AttributeValue.builder().s("Review the identified issue").build());
+                basicFix.put("replaceCode", AttributeValue.builder().s("Apply appropriate security measures").build());
+                basicFix.put("explanation", AttributeValue.builder().s("This issue requires manual review and security implementation.").build());
+                
+                item.put("suggestion", AttributeValue.builder().m(Map.of(
+                    "immediateFix", AttributeValue.builder().m(basicFix).build()
+                )).build());
+            }
+            
+            // Add metadata
             item.put("tokensUsed", AttributeValue.builder().n(String.valueOf(suggestion.getTokensUsed())).build());
             item.put("cost", AttributeValue.builder().n(String.valueOf(suggestion.getCost())).build());
-            item.put("timestamp", AttributeValue.builder().n(String.valueOf(suggestion.getTimestamp())).build());
-            item.put("modelUsed", AttributeValue.builder().s(suggestion.getModelUsed()).build());
-            
-            // Add TTL (7 days)
-            long ttl = System.currentTimeMillis() / 1000 + (7 * 24 * 60 * 60);
-            item.put("expiresAt", AttributeValue.builder().n(String.valueOf(ttl)).build());
+            item.put("modelUsed", AttributeValue.builder().s(suggestion.getModelUsed() != null ? 
+                suggestion.getModelUsed() : "nova-lite").build());
+            item.put("timestamp", AttributeValue.builder().n(String.valueOf(System.currentTimeMillis())).build());
             
             PutItemRequest request = PutItemRequest.builder()
                 .tableName(ISSUE_DETAILS_TABLE)
@@ -189,9 +215,10 @@ public class DynamoDBService {
                 .build();
             
             dynamoDbClient.putItem(request);
+            log.debug("Stored suggestion for issue: {}", suggestion.getIssueId());
             
         } catch (Exception e) {
-            log.error("Failed to store suggestion for issue {}: {}", suggestion.getIssueId(), e.getMessage(), e);
+            log.error("Failed to store suggestion for issue {}: {}", suggestion.getIssueId(), e.getMessage());
         }
     }
     

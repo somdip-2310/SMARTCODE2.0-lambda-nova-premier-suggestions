@@ -275,7 +275,7 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 	    double cost = 0.0;
 	    int successCount = 0;
 	    int failureCount = 0;
-	    long baseDelay = 5000L; // 5 second base delay between requests
+	    long baseDelay = 2000L; // 5 second base delay between requests
 
 	    for (int i = 0; i < issues.size(); i++) {
 	        try {
@@ -330,17 +330,18 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 	 * Calculate adaptive delay based on success/failure rate
 	 */
 	private long calculateSequentialDelay(long baseDelay, int failures, int successes) {
+	    // More aggressive optimization for better performance
 	    if (failures == 0) {
-	        return baseDelay; // Standard delay when everything works
+	        return Math.max(1000L, baseDelay / 2); // Reduce delay when successful
 	    }
 	    
 	    double failureRate = (double) failures / (failures + successes);
 	    if (failureRate > 0.5) {
-	        return baseDelay * 3; // Triple delay if >50% failure rate
+	        return baseDelay * 2; // Only double for high failure rates
 	    } else if (failureRate > 0.25) {
-	        return baseDelay * 2; // Double delay if >25% failure rate  
+	        return (long) (baseDelay * 1.5); // Moderate increase
 	    } else {
-	        return (long) (baseDelay * 1.5); // 50% increase for any failures
+	        return baseDelay; // Standard delay for low failure rates
 	    }
 	}
 	
@@ -702,8 +703,8 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 	            objectMapper.readTree(sanitized);
 	            return sanitized;
 	        } catch (Exception parseTest) {
-	            log.error("⚠️ JSON validation failed, using fallback sanitization");
-	            return createFallbackJsonResponse(jsonContent);
+	        	log.warn("⚠️ JSON validation failed, using enhanced sanitization: {}", parseTest.getMessage());
+	        	return createEnhancedFallbackJsonResponse(jsonContent);
 	        }
 	        
 	    } catch (Exception e) {
@@ -764,7 +765,52 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 		return DeveloperSuggestion.Prevention.builder().guidelines((List<String>) preventionData.get("guidelines"))
 				.tools(tools).codeReviewChecklist((List<String>) preventionData.get("codeReviewChecklist")).build();
 	}
-
+	
+	private String createEnhancedFallbackJsonResponse(String originalContent) {
+	    // Try to extract key information from malformed JSON
+	    String title = "Code Review Required";
+	    String explanation = "This issue requires manual review and implementation of security best practices.";
+	    
+	    // Try to extract issue type from content
+	    if (originalContent != null) {
+	        if (originalContent.toLowerCase().contains("sql")) {
+	            title = "SQL Injection Fix Required";
+	            explanation = "Use parameterized queries to prevent SQL injection vulnerabilities.";
+	        } else if (originalContent.toLowerCase().contains("xss")) {
+	            title = "XSS Prevention Required";
+	            explanation = "Implement input validation and output encoding to prevent XSS attacks.";
+	        } else if (originalContent.toLowerCase().contains("security")) {
+	            title = "Security Issue Fix Required";
+	            explanation = "Review and implement appropriate security measures for this vulnerability.";
+	        }
+	    }
+	    
+	    return String.format("""
+	        {
+	          "immediateFix": {
+	            "title": "%s",
+	            "searchCode": "Review the identified code section",
+	            "replaceCode": "Apply appropriate security measures and best practices",
+	            "explanation": "%s"
+	          },
+	          "bestPractice": {
+	            "title": "Follow Security Guidelines",
+	            "code": "// Implement according to security best practices\\n// Refer to OWASP guidelines",
+	            "benefits": ["Improved security", "Better maintainability", "Reduced vulnerabilities"]
+	          },
+	          "testing": {
+	            "testCase": "// Add comprehensive unit tests for security",
+	            "validationSteps": ["Review code changes", "Test with security tools", "Verify mitigation"]
+	          },
+	          "prevention": {
+	            "guidelines": ["Follow secure coding practices", "Regular security reviews", "Use static analysis tools"],
+	            "tools": [{"name": "Security Scanner", "description": "Automated security vulnerability scanning"}],
+	            "codeReviewChecklist": ["Security implications", "Best practices compliance", "Vulnerability mitigation"]
+	          }
+	        }
+	        """, title, explanation);
+	}
+	
 	private DeveloperSuggestion createFallbackSuggestion(String issueId, Map<String, Object> issue, int tokensUsed,
 			double cost) {
 		// Create basic fix guidance based on issue type

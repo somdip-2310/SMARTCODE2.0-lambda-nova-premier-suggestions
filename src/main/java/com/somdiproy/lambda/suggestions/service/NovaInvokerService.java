@@ -404,51 +404,148 @@ public class NovaInvokerService {
 	 * Parse Nova response
 	 */
 	private NovaResponse parseResponse(String responseBody, String modelId) throws Exception {
-		Map<String, Object> responseMap = objectMapper.readValue(responseBody, Map.class);
+	    Map<String, Object> responseMap = objectMapper.readValue(responseBody, Map.class);
 
-		// Extract content from Nova response format
-		String responseText = extractResponseText(responseMap);
+	    // Extract content from Nova response format
+	    String responseText = extractResponseText(responseMap);
 
-		// Extract token usage
-		Map<String, Object> usage = (Map<String, Object>) responseMap.get("usage");
-		int inputTokens = usage != null ? (Integer) usage.getOrDefault("input_tokens", 0) : 0;
-		int outputTokens = usage != null ? (Integer) usage.getOrDefault("output_tokens", 0) : 0;
+	    // Extract token usage with enhanced extraction
+	    Map<String, Object> usage = (Map<String, Object>) responseMap.get("usage");
+	    int inputTokens = 0;
+	    int outputTokens = 0;
+	    int totalTokens = 0;
 
-		// Calculate cost
-		double cost = calculateCost(inputTokens, outputTokens);
+	    if (usage != null) {
+	        // Try multiple possible field names for token counts
+	        inputTokens = getIntegerValue(usage, "input_tokens", "inputTokens");
+	        outputTokens = getIntegerValue(usage, "output_tokens", "outputTokens");
+	        totalTokens = getIntegerValue(usage, "total_tokens", "totalTokens");
+	        
+	        // If individual tokens are 0 but total exists, estimate split
+	        if (inputTokens == 0 && outputTokens == 0 && totalTokens > 0) {
+	            inputTokens = (int) (totalTokens * 0.6); // Typical input ratio
+	            outputTokens = (int) (totalTokens * 0.4); // Typical output ratio
+	        }
+	        
+	        // Calculate total if not provided but individuals are
+	        if (totalTokens == 0 && (inputTokens > 0 || outputTokens > 0)) {
+	            totalTokens = inputTokens + outputTokens;
+	        }
+	    }
+	    
+	    // Fallback estimation if no usage data available
+	    if (inputTokens == 0 && outputTokens == 0) {
+	        // Estimate based on content length as last resort
+	        inputTokens = Math.max(100, estimateTokensFromContent(responseText));
+	        outputTokens = Math.max(50, responseText.length() / 4);
+	        totalTokens = inputTokens + outputTokens;
+	        log.warn("No token usage data found for model {}, using estimation: input={}, output={}", 
+	                modelId, inputTokens, outputTokens);
+	    }
 
-		log.info("Nova {} invocation successful - Tokens: {}, Cost: ${:.6f}", modelId, inputTokens + outputTokens,
-				cost);
+	    // Calculate cost
+	    double cost = calculateCost(inputTokens, outputTokens);
 
-		return NovaResponse.builder().responseText(responseText).inputTokens(inputTokens).outputTokens(outputTokens)
-				.totalTokens(inputTokens + outputTokens).estimatedCost(cost).modelId(modelId).successful(true)
-				.timestamp(System.currentTimeMillis()).build();
+	    log.info("Nova {} invocation successful - Input: {}, Output: {}, Total: {}, Cost: ${:.6f}", 
+	            modelId, inputTokens, outputTokens, totalTokens, cost);
+
+	    return NovaResponse.builder()
+	            .responseText(responseText)
+	            .inputTokens(inputTokens)
+	            .outputTokens(outputTokens)
+	            .totalTokens(totalTokens)
+	            .estimatedCost(cost)
+	            .modelId(modelId)
+	            .successful(true)
+	            .timestamp(System.currentTimeMillis())
+	            .build();
 	}
 
 	/**
+	 * Get integer value from usage map with multiple possible field names
+	 */
+	private int getIntegerValue(Map<String, Object> usage, String... fieldNames) {
+	    for (String fieldName : fieldNames) {
+	        Object value = usage.get(fieldName);
+	        if (value instanceof Number) {
+	            return ((Number) value).intValue();
+	        }
+	        if (value instanceof String) {
+	            try {
+	                return Integer.parseInt((String) value);
+	            } catch (NumberFormatException e) {
+	                // Continue to next field name
+	            }
+	        }
+	    }
+	    return 0;
+	}
+
+	/**
+	 * Estimate token count from content length (rough approximation)
+	 */
+	private int estimateTokensFromContent(String content) {
+	    if (content == null || content.trim().isEmpty()) {
+	        return 0;
+	    }
+	    // Rough estimation: 1 token per 4 characters for English text
+	    // This is a fallback when actual token counts aren't available
+	    return Math.max(50, content.length() / 4);
+	}
+	
+	private int getIntegerValue(Object usage, String... fieldNames) {
+	    if (usage instanceof Map) {
+	        Map<String, Object> usageMap = (Map<String, Object>) usage;
+	        for (String fieldName : fieldNames) {
+	            Object value = usageMap.get(fieldName);
+	            if (value instanceof Number) {
+	                return ((Number) value).intValue();
+	            }
+	        }
+	    }
+	    return 0;
+	}
+	
+	/**
 	 * Extract response text from Nova response format
 	 */
-	private String extractResponseText(Map<String, Object> responseMap) {
-		// Nova response format: {"output": {"message": {"content": [{"text": "..."}]}}}
-		try {
-			Map<String, Object> output = (Map<String, Object>) responseMap.get("output");
-			if (output != null) {
-				Map<String, Object> message = (Map<String, Object>) output.get("message");
-				if (message != null) {
-					List<Map<String, Object>> content = (List<Map<String, Object>>) message.get("content");
-					if (content != null && !content.isEmpty()) {
-						return (String) content.get(0).get("text");
-					}
-				}
-			}
-
-			// Fallback: try direct text field
-			return (String) responseMap.getOrDefault("text", "No response text found");
-
-		} catch (Exception e) {
-			log.warn("Error extracting response text, using fallback: " + e.getMessage());
-			return responseMap.toString(); // Last resort
-		}
+	private String extractResponseText(Object response) {
+	    try {
+	        // Handle proper ConverseResponse object
+	        if (response instanceof software.amazon.awssdk.services.bedrockruntime.model.ConverseResponse) {
+	            software.amazon.awssdk.services.bedrockruntime.model.ConverseResponse converseResponse = 
+	                (software.amazon.awssdk.services.bedrockruntime.model.ConverseResponse) response;
+	            
+	            if (converseResponse.output() != null && converseResponse.output().message() != null) {
+	                var content = converseResponse.output().message().content();
+	                if (!content.isEmpty() && content.get(0).text() != null) {
+	                    return content.get(0).text();
+	                }
+	            }
+	        }
+	        
+	        // Fallback for Map-based response (legacy)
+	        if (response instanceof Map) {
+	            Map<String, Object> responseMap = (Map<String, Object>) response;
+	            Map<String, Object> output = (Map<String, Object>) responseMap.get("output");
+	            if (output != null) {
+	                Map<String, Object> message = (Map<String, Object>) output.get("message");
+	                if (message != null) {
+	                    List<Map<String, Object>> content = (List<Map<String, Object>>) message.get("content");
+	                    if (content != null && !content.isEmpty()) {
+	                        return (String) content.get(0).get("text");
+	                    }
+	                }
+	            }
+	            return (String) responseMap.getOrDefault("text", "No response text found");
+	        }
+	        
+	        return response.toString();
+	        
+	    } catch (Exception e) {
+	        log.warn("Error extracting response text, using fallback: " + e.getMessage());
+	        return response.toString();
+	    }
 	}
 
 	/**
