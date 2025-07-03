@@ -47,18 +47,18 @@ public class NovaInvokerService {
             );
             
             requestBody.put("messages", messages);
-            requestBody.put("max_tokens", maxTokens);
-            requestBody.put("temperature", temperature);
-            //requestBody.put("top_p", topP); // Not supported in Nova
+            // FIXED: Removed max_tokens and temperature from root level
             
-            // Additional Nova-specific parameters
+            // Nova-specific inference configuration
+            // All model parameters must be inside inferenceConfig only
             Map<String, Object> inferenceConfig = new HashMap<>();
             inferenceConfig.put("max_tokens", maxTokens);
             inferenceConfig.put("temperature", temperature);
-            //inferenceConfig.put("top_p", topP); // Not supported in Nova
+            // Note: top_p is not supported in Nova models
             requestBody.put("inferenceConfig", inferenceConfig);
             
             String requestJson = objectMapper.writeValueAsString(requestBody);
+            log.debug("Nova API Request: {}", requestJson);
             
             // Create Bedrock request
             InvokeModelRequest request = InvokeModelRequest.builder()
@@ -71,6 +71,7 @@ public class NovaInvokerService {
             // Execute request
             InvokeModelResponse response = bedrockClient.invokeModel(request);
             String responseBody = response.body().asUtf8String();
+            log.debug("Nova API Response: {}", responseBody);
             
             // Parse Nova response
             Map<String, Object> responseMap = objectMapper.readValue(responseBody, Map.class);
@@ -85,6 +86,9 @@ public class NovaInvokerService {
             
             // Calculate cost
             double cost = calculateCost(inputTokens, outputTokens);
+            
+            log.info("Nova {} invocation successful - Tokens: {}, Cost: ${:.6f}", 
+                    modelId, inputTokens + outputTokens, cost);
             
             return NovaResponse.builder()
                 .responseText(responseText)
@@ -102,6 +106,8 @@ public class NovaInvokerService {
             return NovaResponse.builder()
                 .successful(false)
                 .errorMessage("Failed to invoke Nova: " + e.getMessage())
+                .modelId(modelId)
+                .timestamp(System.currentTimeMillis())
                 .build();
         }
     }
