@@ -479,18 +479,17 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 	private NovaInvokerService.NovaResponse createSimpleTemplateResponse(String prompt, int maxTokens) {
 		String templateResponse = generateTemplateBasedSuggestion(prompt);
 		
-		// Create a simple response object
-		return new NovaInvokerService.NovaResponse(
-			templateResponse,
-			50, // estimated input tokens
-			100, // estimated output tokens
-			150, // total tokens
-			0.0001, // minimal cost
-			"TEMPLATE_MODE",
-			true,
-			System.currentTimeMillis(),
-			null
-		);
+		// Create a simple response object using builder pattern
+		return NovaInvokerService.NovaResponse.builder()
+		    .responseText(templateResponse)
+		    .inputTokens(50)
+		    .outputTokens(100)
+		    .totalTokens(150)
+		    .estimatedCost(0.0001)
+		    .modelId("TEMPLATE_MODE")
+		    .successful(true)
+		    .timestamp(System.currentTimeMillis())
+		    .build();
 	}
 
 	/**

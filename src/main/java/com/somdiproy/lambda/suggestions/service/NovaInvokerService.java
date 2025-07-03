@@ -258,18 +258,18 @@ public class NovaInvokerService {
 	    String issueType = extractIssueType(prompt);
 	    String templateResponse = generateTemplateResponse(issueType, prompt);
 	    
-	    // Create response object matching your existing structure
-	    NovaResponse response = new NovaResponse();
-	    response.setResponseText(templateResponse);
-	    response.setInputTokens(Math.min(prompt.length() / 4, 100)); // Estimate
-	    response.setOutputTokens(Math.min(templateResponse.length() / 4, 50));
-	    response.setTotalTokens(response.getInputTokens() + response.getOutputTokens());
-	    response.setEstimatedCost(0.0001); // Minimal cost for template
-	    response.setModelId("TEMPLATE_MODE");
-	    response.setSuccessful(true);
-	    response.setTimestamp(System.currentTimeMillis());
+	 // Create response object using builder pattern
+	    return NovaResponse.builder()
+	        .responseText(templateResponse)
+	        .inputTokens(Math.min(prompt.length() / 4, 100))
+	        .outputTokens(Math.min(templateResponse.length() / 4, 50))
+	        .totalTokens(Math.min(prompt.length() / 4, 100) + Math.min(templateResponse.length() / 4, 50))
+	        .estimatedCost(0.0001)
+	        .modelId("TEMPLATE_MODE")
+	        .successful(true)
+	        .timestamp(System.currentTimeMillis())
+	        .build();
 	    
-	    return response;
 	}
 
 	/**
@@ -296,80 +296,88 @@ public class NovaInvokerService {
 	}
 
 	/**
-	 * Generate template-based suggestion
+	 * Generate template-based suggestion from prompt analysis
 	 */
 	private String generateTemplateResponse(String issueType, String prompt) {
 	    Map<String, String> templates = Map.of(
 	        "SQL_INJECTION", """
-	            **Fix: Use Parameterized Queries**
-	            
-	            Replace string concatenation with PreparedStatement:
-	            ```java
-	            // Before (vulnerable)
-	            String query = "SELECT * FROM users WHERE id = '" + userId + "'";
-	            
-	            // After (secure)
-	            String query = "SELECT * FROM users WHERE id = ?";
-	            PreparedStatement stmt = connection.prepareStatement(query);
-	            stmt.setString(1, userId);
-	            ResultSet rs = stmt.executeQuery();
-	            ```
-	            
-	            **Why this works:** Parameterized queries separate code from data, preventing injection attacks.
-	            **Test:** Try malicious input like "'; DROP TABLE users; --" to verify it's handled safely.
-	            """,
-	            
+	        {
+	          "immediateFix": {
+	            "title": "Use Parameterized Queries",
+	            "searchCode": "String query = \\"SELECT * FROM users WHERE id = '\\" + userId + \\"'\\";",
+	            "replaceCode": "String query = \\"SELECT * FROM users WHERE id = ?\\"; PreparedStatement stmt = connection.prepareStatement(query); stmt.setString(1, userId);",
+	            "explanation": "Parameterized queries prevent SQL injection by separating code from data."
+	          },
+	          "bestPractice": {
+	            "title": "Always Use Prepared Statements",
+	            "code": "PreparedStatement stmt = connection.prepareStatement(\\"SELECT * FROM users WHERE id = ?\\"); stmt.setString(1, userId);",
+	            "benefits": ["Prevents SQL injection", "Better performance", "Cleaner code"]
+	          },
+	          "testing": {
+	            "testCase": "@Test public void testSqlInjectionPrevention() { String maliciousInput = \\"'; DROP TABLE users; --\\"; }",
+	            "validationSteps": ["Test with malicious input", "Verify database integrity", "Check query logs"]
+	          },
+	          "prevention": {
+	            "guidelines": ["Always use parameterized queries", "Validate input length and format", "Use least privilege database accounts"],
+	            "tools": [{"name": "SonarQube", "description": "Static analysis for SQL injection detection"}],
+	            "codeReviewChecklist": ["Check for string concatenation in SQL", "Verify parameterized queries usage", "Review input validation"]
+	          }
+	        }
+	        """,
+	        
 	        "XSS", """
-	            **Fix: Input Sanitization**
-	            
-	            Sanitize user input before display:
-	            ```java
-	            // Before (vulnerable)
-	            response.getWriter().println("<p>" + userInput + "</p>");
-	            
-	            // After (secure)
-	            import org.apache.commons.text.StringEscapeUtils;
-	            String safeInput = StringEscapeUtils.escapeHtml4(userInput);
-	            response.getWriter().println("<p>" + safeInput + "</p>");
-	            ```
-	            
-	            **Why this works:** HTML escaping converts dangerous characters like < > to safe entities.
-	            **Test:** Input "<script>alert('xss')</script>" should display as text, not execute.
-	            """,
-	            
-	        "INEFFICIENT_LOOP", """
-	            **Fix: Use Stream Operations**
-	            
-	            Replace traditional loops with streams:
-	            ```java
-	            // Before (inefficient)
-	            List<String> result = new ArrayList<>();
-	            for (Item item : items) {
-	                if (item.isValid()) {
-	                    result.add(item.getName());
-	                }
-	            }
-	            
-	            // After (optimized)
-	            List<String> result = items.stream()
-	                .filter(Item::isValid)
-	                .map(Item::getName)
-	                .collect(Collectors.toList());
-	            ```
-	            
-	            **Why this works:** Streams can be optimized by the JVM and are more readable.
-	            **Test:** Benchmark with large datasets to see performance improvement.
-	            """
+	        {
+	          "immediateFix": {
+	            "title": "Sanitize Input and Encode Output",
+	            "searchCode": "response.getWriter().println(\\"<p>\\" + userInput + \\"</p>\\");",
+	            "replaceCode": "String safeInput = StringEscapeUtils.escapeHtml4(userInput); response.getWriter().println(\\"<p>\\" + safeInput + \\"</p>\\");",
+	            "explanation": "HTML escaping converts dangerous characters to safe entities."
+	          },
+	          "bestPractice": {
+	            "title": "Input Validation and Output Encoding",
+	            "code": "String safeOutput = StringEscapeUtils.escapeHtml4(userInput);",
+	            "benefits": ["Prevents XSS attacks", "Secure data handling", "User safety"]
+	          },
+	          "testing": {
+	            "testCase": "@Test public void testXssPrevention() { String maliciousInput = \\"<script>alert('xss')</script>\\"; }",
+	            "validationSteps": ["Test with malicious scripts", "Verify output encoding", "Check CSP headers"]
+	          },
+	          "prevention": {
+	            "guidelines": ["Always encode output", "Validate input format", "Use Content Security Policy"],
+	            "tools": [{"name": "OWASP ZAP", "description": "Security testing for XSS vulnerabilities"}],
+	            "codeReviewChecklist": ["Check output encoding", "Verify input validation", "Review CSP implementation"]
+	          }
+	        }
+	        """
 	    );
 	    
 	    return templates.getOrDefault(issueType, 
-	        "**Generic Fix Recommendation**\n\n" +
-	        "Review this issue and apply appropriate best practices. " +
-	        "Consider security implications, performance impact, and maintainability. " +
-	        "Test changes thoroughly before deployment."
+	        """
+	        {
+	          "immediateFix": {
+	            "title": "Review and Apply Best Practices",
+	            "searchCode": "// Review the identified code section",
+	            "replaceCode": "// Apply appropriate security measures and best practices",
+	            "explanation": "This issue requires manual review and application of security best practices."
+	          },
+	          "bestPractice": {
+	            "title": "Follow Security Guidelines",
+	            "code": "// Implement according to OWASP guidelines",
+	            "benefits": ["Improved security", "Better maintainability", "Reduced vulnerabilities"]
+	          },
+	          "testing": {
+	            "testCase": "// Add appropriate unit tests",
+	            "validationSteps": ["Review code changes", "Test functionality", "Verify security measures"]
+	          },
+	          "prevention": {
+	            "guidelines": ["Follow OWASP guidelines", "Regular security reviews", "Use static analysis tools"],
+	            "tools": [{"name": "Static Analysis", "description": "Automated security scanning"}],
+	            "codeReviewChecklist": ["Security implications", "Best practices compliance", "Test coverage"]
+	          }
+	        }
+	        """
 	    );
 	}
-	
 	/**
 	 * Build request body for Nova models
 	 */

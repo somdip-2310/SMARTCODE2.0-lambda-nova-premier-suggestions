@@ -1,9 +1,11 @@
 package com.somdiproy.lambda.suggestions.service;
 
-import org.springframework.stereotype.Service;
 import java.util.*;
 
-@Service
+/**
+ * Template service for generating fallback suggestions
+ * Note: No Spring annotations as this runs in Lambda environment
+ */
 public class TemplateService {
     
     private static final Map<String, String> SECURITY_TEMPLATES = Map.of(
