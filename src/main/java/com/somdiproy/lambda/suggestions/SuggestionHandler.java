@@ -13,10 +13,11 @@ import com.somdiproy.lambda.suggestions.util.TokenOptimizer;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 import java.util.*;
+import java.util.concurrent.*;
 import java.util.stream.Collectors;
 
 /**
- * Lambda function for Nova Premier suggestion generation
+ * Enhanced Lambda function for Nova Premier suggestion generation with batch processing
  * Handler: com.somdiproy.lambda.suggestions.SuggestionHandler::handleRequest
  */
 public class SuggestionHandler implements RequestHandler<SuggestionRequest, SuggestionResponse> {
@@ -31,9 +32,46 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
     private static final String BEDROCK_REGION = System.getenv("BEDROCK_REGION"); // us-east-1
     private static final int MAX_TOKENS = Integer.parseInt(System.getenv("MAX_TOKENS")); // 8000
     
+    // Batch processing configuration
+    private static final int BATCH_SIZE = Integer.parseInt(System.getenv().getOrDefault("BATCH_SIZE", "5"));
+    private static final long BATCH_DELAY_MS = Long.parseLong(System.getenv().getOrDefault("BATCH_DELAY_MS", "2000"));
+    private static final int MAX_CONCURRENT_CALLS = Integer.parseInt(System.getenv().getOrDefault("MAX_CONCURRENT_CALLS", "2"));
+    
+    // Token budget management
+    private static final int TOKEN_BUDGET = Integer.parseInt(System.getenv().getOrDefault("TOKEN_BUDGET", "40000"));
+    private static final int TOKEN_BUFFER = 5000; // Reserve tokens for safety
+    
+    // Timeout management
+    private static final long TIMEOUT_BUFFER_MS = 30000; // 30 seconds buffer before Lambda timeout
+    
+    // Executor service for parallel processing within batches
+    private static ExecutorService executorService;
+    private static final Object executorLock = new Object();
+    
     public SuggestionHandler() {
         this.novaInvoker = new NovaInvokerService(BEDROCK_REGION);
         this.dynamoDBService = new DynamoDBService();
+        initializeExecutorService();
+    }
+    
+    private void initializeExecutorService() {
+        synchronized (executorLock) {
+            if (executorService == null || executorService.isShutdown()) {
+                executorService = new ThreadPoolExecutor(
+                    MAX_CONCURRENT_CALLS,
+                    MAX_CONCURRENT_CALLS,
+                    60L, TimeUnit.SECONDS,
+                    new LinkedBlockingQueue<>(100),
+                    r -> {
+                        Thread t = new Thread(r);
+                        t.setDaemon(true);
+                        t.setName("nova-suggestion-worker-" + t.getId());
+                        return t;
+                    },
+                    new ThreadPoolExecutor.CallerRunsPolicy()
+                );
+            }
+        }
     }
     
     @Override
@@ -52,73 +90,202 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
             }
             
             List<Map<String, Object>> issues = request.getIssues();
-            logger.log(String.format("🎯 Processing %d issues for suggestions", issues.size()));
+            logger.log(String.format("🎯 Processing %d issues for suggestions in batches of %d", 
+                      issues.size(), BATCH_SIZE));
             
-            // Process issues and generate suggestions
-            List<DeveloperSuggestion> suggestions = new ArrayList<>();
+            // Create batches for processing
+            List<List<Map<String, Object>>> batches = createBatches(issues, BATCH_SIZE);
+            logger.log(String.format("📦 Created %d batches for processing", batches.size()));
+            
+            // Process batches with throttling prevention
+            List<DeveloperSuggestion> allSuggestions = new ArrayList<>();
             int totalTokensUsed = 0;
             double totalCost = 0.0;
             
-            for (Map<String, Object> issue : issues) {
-                if (context.getRemainingTimeInMillis() < 30000) { // 30 seconds buffer
-                    logger.log("⏰ Approaching timeout, stopping processing");
+            for (int batchIndex = 0; batchIndex < batches.size(); batchIndex++) {
+                // Check timeout
+                if (context.getRemainingTimeInMillis() < TIMEOUT_BUFFER_MS) {
+                    logger.log("⏰ Approaching Lambda timeout, stopping batch processing");
                     break;
                 }
                 
-                try {
-                    DeveloperSuggestion suggestion = generateSuggestionForIssue(issue, logger);
-                    if (suggestion != null) {
-                        suggestions.add(suggestion);
-                        totalTokensUsed += suggestion.getTokensUsed();
-                        totalCost += suggestion.getCost();
-                    }
-                } catch (Exception e) {
-                    logger.log("❌ Error processing issue " + issue.get("id") + ": " + e.getMessage());
+                // Check token budget
+                if (totalTokensUsed > (TOKEN_BUDGET - TOKEN_BUFFER)) {
+                    logger.log(String.format("🪙 Token budget limit approaching (%d/%d), stopping processing", 
+                              totalTokensUsed, TOKEN_BUDGET));
+                    break;
                 }
                 
-                // Stop if we reach token budget
-                if (totalTokensUsed > 35000) {
-                    logger.log("🪙 Token budget reached, stopping processing");
-                    break;
+                List<Map<String, Object>> batch = batches.get(batchIndex);
+                logger.log(String.format("📋 Processing batch %d/%d with %d issues", 
+                          batchIndex + 1, batches.size(), batch.size()));
+                
+                // Add delay between batches to prevent throttling (except for first batch)
+                if (batchIndex > 0) {
+                    long delay = calculateBatchDelay(batchIndex);
+                    logger.log(String.format("⏸️ Waiting %dms before processing next batch", delay));
+                    Thread.sleep(delay);
+                }
+                
+                // Process batch with parallel execution within limits
+                BatchResult batchResult = processBatch(batch, context, logger);
+                
+                // Aggregate results
+                allSuggestions.addAll(batchResult.suggestions);
+                totalTokensUsed += batchResult.tokensUsed;
+                totalCost += batchResult.cost;
+                
+                // Log batch statistics
+                logger.log(String.format("✅ Batch %d complete: %d suggestions, %d tokens, $%.4f", 
+                          batchIndex + 1, batchResult.suggestions.size(), 
+                          batchResult.tokensUsed, batchResult.cost));
+                
+                // Check Nova service statistics and adapt if needed
+                Map<String, Object> stats = novaInvoker.getStatistics();
+                if (shouldSlowDown(stats)) {
+                    logger.log("⚠️ High throttle rate detected, increasing batch delays");
+                    Thread.sleep(BATCH_DELAY_MS * 2); // Extra delay
                 }
             }
             
             // Store results in DynamoDB
             try {
+                // Update analysis status
+                dynamoDBService.updateAnalysisProgress(request.getAnalysisId(), 
+                                                     "suggestions_complete", 
+                                                     allSuggestions.size());
+                
+                // Store suggestions
                 dynamoDBService.storeSuggestions(request.getAnalysisId(), request.getSessionId(), 
-                                               suggestions, totalTokensUsed, totalCost);
+                                               allSuggestions, totalTokensUsed, totalCost);
                 logger.log("💾 Successfully stored suggestions in DynamoDB");
             } catch (Exception e) {
                 logger.log("❌ Failed to store suggestions: " + e.getMessage());
+                // Continue - don't fail the entire operation
             }
             
             // Build response
             processingTime.endTime = System.currentTimeMillis();
             processingTime.totalProcessingTime = processingTime.endTime - processingTime.startTime;
             
+            // Log final statistics
+            Map<String, Object> finalStats = novaInvoker.getStatistics();
+            logger.log(String.format("📊 Final statistics: %s", objectMapper.writeValueAsString(finalStats)));
+            
             SuggestionResponse response = SuggestionResponse.builder()
                 .status("success")
                 .analysisId(request.getAnalysisId())
                 .sessionId(request.getSessionId())
-                .suggestions(suggestions)
-                .summary(buildSummary(suggestions, totalTokensUsed, totalCost))
-                .metadata(buildMetadata(totalTokensUsed, totalCost))
+                .suggestions(allSuggestions)
+                .summary(buildSummary(allSuggestions, totalTokensUsed, totalCost))
+                .metadata(buildMetadata(totalTokensUsed, totalCost, processingTime))
                 .processingTime(processingTime)
                 .build();
             
-            logger.log(String.format("✅ Generated %d suggestions using %d tokens (Cost: $%.4f)", 
-                       suggestions.size(), totalTokensUsed, totalCost));
+            logger.log(String.format("✅ Generated %d suggestions using %d tokens (Cost: $%.4f) in %.2f seconds", 
+                       allSuggestions.size(), totalTokensUsed, totalCost, 
+                       processingTime.totalProcessingTime / 1000.0));
             
             return response;
             
         } catch (Exception e) {
             logger.log("❌ Fatal error in suggestion generation: " + e.getMessage());
+            log.error("Fatal error details:", e);
+            
             processingTime.endTime = System.currentTimeMillis();
             return SuggestionResponse.error(request.getAnalysisId(), request.getSessionId(),
                                            "Failed to generate suggestions: " + e.getMessage());
         }
     }
     
+    /**
+     * Create batches from issues list
+     */
+    private List<List<Map<String, Object>>> createBatches(List<Map<String, Object>> issues, int batchSize) {
+        List<List<Map<String, Object>>> batches = new ArrayList<>();
+        
+        for (int i = 0; i < issues.size(); i += batchSize) {
+            batches.add(issues.subList(i, Math.min(i + batchSize, issues.size())));
+        }
+        
+        return batches;
+    }
+    
+    /**
+     * Calculate delay between batches with progressive backoff
+     */
+    private long calculateBatchDelay(int batchIndex) {
+        // Progressive delay: increases slightly with each batch
+        long baseDelay = BATCH_DELAY_MS;
+        long progressiveDelay = baseDelay + (batchIndex * 500L); // Add 500ms per batch
+        return Math.min(progressiveDelay, 10000L); // Cap at 10 seconds
+    }
+    
+    /**
+     * Check if we should slow down based on statistics
+     */
+    private boolean shouldSlowDown(Map<String, Object> stats) {
+        Map<String, Integer> throttleCounts = (Map<String, Integer>) stats.get("throttleCounts");
+        if (throttleCounts != null && !throttleCounts.isEmpty()) {
+            int totalThrottles = throttleCounts.values().stream().mapToInt(Integer::intValue).sum();
+            return totalThrottles > 2; // Slow down if we've seen more than 2 throttles
+        }
+        
+        String circuitState = (String) stats.get("circuitState");
+        return "HALF_OPEN".equals(circuitState) || "OPEN".equals(circuitState);
+    }
+    
+    /**
+     * Process a batch of issues with controlled parallelism
+     */
+    private BatchResult processBatch(List<Map<String, Object>> batch, Context context, LambdaLogger logger) 
+            throws InterruptedException, ExecutionException {
+        
+        List<Future<DeveloperSuggestion>> futures = new ArrayList<>();
+        
+        // Submit tasks for parallel processing
+        for (Map<String, Object> issue : batch) {
+            Future<DeveloperSuggestion> future = executorService.submit(() -> 
+                generateSuggestionForIssue(issue, logger)
+            );
+            futures.add(future);
+            
+            // Small delay between submissions to prevent burst
+            Thread.sleep(100);
+        }
+        
+        // Collect results
+        List<DeveloperSuggestion> suggestions = new ArrayList<>();
+        int tokensUsed = 0;
+        double cost = 0.0;
+        
+        for (int i = 0; i < futures.size(); i++) {
+            try {
+                // Use timeout to prevent hanging
+                long remainingTime = context.getRemainingTimeInMillis() - TIMEOUT_BUFFER_MS;
+                DeveloperSuggestion suggestion = futures.get(i).get(
+                    Math.min(remainingTime, 60000L), TimeUnit.MILLISECONDS
+                );
+                
+                if (suggestion != null) {
+                    suggestions.add(suggestion);
+                    tokensUsed += suggestion.getTokensUsed();
+                    cost += suggestion.getCost();
+                }
+            } catch (TimeoutException e) {
+                logger.log("⏰ Timeout waiting for suggestion generation");
+                futures.get(i).cancel(true);
+            } catch (Exception e) {
+                logger.log("❌ Error collecting suggestion result: " + e.getMessage());
+            }
+        }
+        
+        return new BatchResult(suggestions, tokensUsed, cost);
+    }
+    
+    /**
+     * Generate suggestion for a single issue with error handling
+     */
     private DeveloperSuggestion generateSuggestionForIssue(Map<String, Object> issue, LambdaLogger logger) {
         try {
             String issueId = (String) issue.get("id");
@@ -127,9 +294,13 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
             // Build optimized prompt
             String prompt = buildSuggestionPrompt(issue);
             
-            // Call Nova Premier
+            // Add token optimization to prevent exceeding limits
+            int estimatedTokens = TokenOptimizer.estimateTokens(prompt);
+            int adjustedMaxTokens = Math.min(MAX_TOKENS, TOKEN_BUDGET / 10); // Limit per issue
+            
+            // Call Nova Premier with retry logic handled by NovaInvokerService
             NovaInvokerService.NovaResponse novaResponse = novaInvoker.invokeNova(
-                MODEL_ID, prompt, MAX_TOKENS, 0.3, 0.9);
+                MODEL_ID, prompt, adjustedMaxTokens, 0.3, 0.9);
             
             if (!novaResponse.isSuccessful()) {
                 logger.log("❌ Nova Premier call failed for issue " + issueId + ": " + novaResponse.getErrorMessage());
@@ -141,8 +312,13 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
                                          novaResponse.getTotalTokens(), novaResponse.getEstimatedCost(),
                                          issue, logger);
             
+        } catch (NovaInvokerService.NovaInvokerException e) {
+            // Handle circuit breaker or other critical errors
+            logger.log("🚫 Nova invoker error: " + e.getMessage());
+            return createFallbackSuggestion((String) issue.get("id"), issue, 0, 0.0);
         } catch (Exception e) {
             logger.log("❌ Error generating suggestion: " + e.getMessage());
+            log.error("Suggestion generation error details:", e);
             return createFallbackSuggestion((String) issue.get("id"), issue, 0, 0.0);
         }
     }
@@ -156,52 +332,38 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
         String codeSnippet = (String) issue.get("codeSnippet");
         String description = (String) issue.get("description");
         
-        prompt.append("# Code Analysis Expert - Developer-Friendly Fix Generation\n\n");
-        prompt.append("You are an expert software engineer specializing in ").append(language)
-              .append(" development. Generate a comprehensive, actionable fix for this code issue.\n\n");
+        // Use concise prompt to optimize token usage
+        prompt.append("# Fix Required for ").append(type).append(" (").append(severity).append(")\n\n");
+        prompt.append("Language: ").append(language).append("\n");
+        prompt.append("Issue: ").append(description).append("\n\n");
         
-        prompt.append("## Issue Details\n");
-        prompt.append("- **Type**: ").append(type).append("\n");
-        prompt.append("- **Severity**: ").append(severity).append("\n");
-        prompt.append("- **Language**: ").append(language).append("\n");
-        prompt.append("- **Description**: ").append(description).append("\n\n");
-        
-        prompt.append("## Problematic Code\n");
-        prompt.append("```").append(language.toLowerCase()).append("\n");
-        prompt.append(codeSnippet).append("\n");
+        prompt.append("Code:\n```").append(language.toLowerCase()).append("\n");
+        prompt.append(TokenOptimizer.truncateCode(codeSnippet, 500)).append("\n");
         prompt.append("```\n\n");
         
-        prompt.append("## Required Response Format\n");
-        prompt.append("Provide a comprehensive fix in this exact JSON format:\n\n");
-        prompt.append("```json\n");
-        prompt.append("{\n");
+        prompt.append("Generate comprehensive fix as JSON:\n");
+        prompt.append("```json\n{\n");
         prompt.append("  \"immediateFix\": {\n");
-        prompt.append("    \"title\": \"Brief fix description\",\n");
-        prompt.append("    \"searchCode\": \"Exact code to find and replace\",\n");
-        prompt.append("    \"replaceCode\": \"Exact replacement code\",\n");
-        prompt.append("    \"explanation\": \"Detailed explanation of the fix\"\n");
+        prompt.append("    \"title\": \"Brief description\",\n");
+        prompt.append("    \"searchCode\": \"Exact problematic code\",\n");
+        prompt.append("    \"replaceCode\": \"Fixed code\",\n");
+        prompt.append("    \"explanation\": \"Why this fixes the issue\"\n");
         prompt.append("  },\n");
         prompt.append("  \"bestPractice\": {\n");
-        prompt.append("    \"title\": \"Best practice recommendation\",\n");
-        prompt.append("    \"code\": \"Example of industry best practice\",\n");
-        prompt.append("    \"benefits\": [\"List of specific benefits\"]\n");
+        prompt.append("    \"title\": \"Best practice name\",\n");
+        prompt.append("    \"code\": \"Example implementation\",\n");
+        prompt.append("    \"benefits\": [\"Benefit 1\", \"Benefit 2\"]\n");
         prompt.append("  },\n");
         prompt.append("  \"testing\": {\n");
-        prompt.append("    \"testCase\": \"Complete unit test code\",\n");
-        prompt.append("    \"validationSteps\": [\"Step-by-step validation instructions\"]\n");
+        prompt.append("    \"testCase\": \"Unit test code\",\n");
+        prompt.append("    \"validationSteps\": [\"Step 1\", \"Step 2\"]\n");
         prompt.append("  },\n");
         prompt.append("  \"prevention\": {\n");
-        prompt.append("    \"guidelines\": [\"Prevention guidelines\"],\n");
-        prompt.append("    \"tools\": [{\n");
-        prompt.append("      \"name\": \"Tool name\",\n");
-        prompt.append("      \"description\": \"How it helps prevent this issue\"\n");
-        prompt.append("    }],\n");
-        prompt.append("    \"codeReviewChecklist\": [\"Code review checklist items\"]\n");
+        prompt.append("    \"guidelines\": [\"Guideline 1\", \"Guideline 2\"],\n");
+        prompt.append("    \"tools\": [{\"name\": \"Tool\", \"description\": \"How it helps\"}],\n");
+        prompt.append("    \"codeReviewChecklist\": [\"Check 1\", \"Check 2\"]\n");
         prompt.append("  }\n");
-        prompt.append("}\n");
-        prompt.append("```\n\n");
-        
-        prompt.append("Generate the comprehensive fix now:");
+        prompt.append("}\n```");
         
         return prompt.toString();
     }
@@ -238,6 +400,7 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
     }
     
     private String extractJsonFromResponse(String response) {
+        // Try to find JSON within code blocks first
         int jsonStart = response.indexOf("```json");
         int jsonEnd = response.lastIndexOf("```");
         
@@ -295,13 +458,18 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
         if (preventionData == null) return null;
         
         List<DeveloperSuggestion.Tool> tools = new ArrayList<>();
-        List<Map<String, String>> toolsData = (List<Map<String, String>>) preventionData.get("tools");
-        if (toolsData != null) {
-            for (Map<String, String> toolData : toolsData) {
-                tools.add(DeveloperSuggestion.Tool.builder()
-                    .name(toolData.get("name"))
-                    .description(toolData.get("description"))
-                    .build());
+        Object toolsObj = preventionData.get("tools");
+        
+        if (toolsObj instanceof List) {
+            List<Object> toolsList = (List<Object>) toolsObj;
+            for (Object toolObj : toolsList) {
+                if (toolObj instanceof Map) {
+                    Map<String, String> toolData = (Map<String, String>) toolObj;
+                    tools.add(DeveloperSuggestion.Tool.builder()
+                        .name(toolData.get("name"))
+                        .description(toolData.get("description"))
+                        .build());
+                }
             }
         }
         
@@ -322,15 +490,20 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
             .language((String) issue.get("language"))
             .immediateFix(DeveloperSuggestion.ImmediateFix.builder()
                 .title("Manual Review Required")
-                .explanation("This issue requires manual review and custom fixing approach.")
-                .searchCode((String) issue.get("codeSnippet"))
-                .replaceCode("// TODO: Implement fix based on issue description")
+                .explanation("This issue requires manual review due to processing limitations.")
+                .searchCode(truncateString((String) issue.get("codeSnippet"), 200))
+                .replaceCode("// TODO: Implement fix based on issue: " + issue.get("description"))
                 .build())
             .tokensUsed(tokensUsed)
             .cost(cost)
             .timestamp(System.currentTimeMillis())
             .modelUsed(MODEL_ID)
             .build();
+    }
+    
+    private String truncateString(String str, int maxLength) {
+        if (str == null) return "";
+        return str.length() > maxLength ? str.substring(0, maxLength) + "..." : str;
     }
     
     private SuggestionResponse.Summary buildSummary(List<DeveloperSuggestion> suggestions, 
@@ -356,12 +529,56 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
             .build();
     }
     
-    private Map<String, Object> buildMetadata(int totalTokens, double totalCost) {
+    private Map<String, Object> buildMetadata(int totalTokens, double totalCost, 
+                                             SuggestionResponse.ProcessingTime processingTime) {
         Map<String, Object> metadata = new HashMap<>();
         metadata.put("modelUsed", MODEL_ID);
         metadata.put("totalTokensUsed", totalTokens);
         metadata.put("totalCost", totalCost);
         metadata.put("timestamp", System.currentTimeMillis());
+        metadata.put("batchSize", BATCH_SIZE);
+        metadata.put("batchDelayMs", BATCH_DELAY_MS);
+        metadata.put("processingTimeMs", processingTime.totalProcessingTime);
+        
+        // Add Nova service statistics
+        try {
+            metadata.put("novaStatistics", novaInvoker.getStatistics());
+        } catch (Exception e) {
+            log.warn("Failed to get Nova statistics", e);
+        }
+        
         return metadata;
+    }
+    
+    /**
+     * Result container for batch processing
+     */
+    private static class BatchResult {
+        final List<DeveloperSuggestion> suggestions;
+        final int tokensUsed;
+        final double cost;
+        
+        BatchResult(List<DeveloperSuggestion> suggestions, int tokensUsed, double cost) {
+            this.suggestions = suggestions;
+            this.tokensUsed = tokensUsed;
+            this.cost = cost;
+        }
+    }
+    
+    /**
+     * Cleanup resources on Lambda container shutdown
+     */
+    public void cleanup() {
+        if (executorService != null && !executorService.isShutdown()) {
+            executorService.shutdown();
+            try {
+                if (!executorService.awaitTermination(5, TimeUnit.SECONDS)) {
+                    executorService.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                executorService.shutdownNow();
+                Thread.currentThread().interrupt();
+            }
+        }
     }
 }

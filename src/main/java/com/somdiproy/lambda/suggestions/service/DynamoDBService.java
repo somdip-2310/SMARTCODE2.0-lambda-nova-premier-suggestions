@@ -58,6 +58,60 @@ public class DynamoDBService {
     }
     
     /**
+     * Update analysis progress status
+     * Used to track progress during different stages of analysis
+     */
+    public void updateAnalysisProgress(String analysisId, String status, int suggestionCount) {
+        try {
+            Map<String, AttributeValue> key = Map.of(
+                "analysisId", AttributeValue.builder().s(analysisId).build()
+            );
+            
+            Map<String, AttributeValueUpdate> updates = new HashMap<>();
+            
+            // Update status
+            updates.put("status", AttributeValueUpdate.builder()
+                .value(AttributeValue.builder().s(status).build())
+                .action(AttributeAction.PUT)
+                .build());
+            
+            // Update progress timestamp
+            updates.put("lastUpdatedAt", AttributeValueUpdate.builder()
+                .value(AttributeValue.builder().n(String.valueOf(System.currentTimeMillis())).build())
+                .action(AttributeAction.PUT)
+                .build());
+            
+            // Update suggestion count if provided
+            if (suggestionCount > 0) {
+                updates.put("suggestionCount", AttributeValueUpdate.builder()
+                    .value(AttributeValue.builder().n(String.valueOf(suggestionCount)).build())
+                    .action(AttributeAction.PUT)
+                    .build());
+            }
+            
+            // Calculate and update progress percentage
+            int progressPercentage = calculateProgressPercentage(status);
+            updates.put("progressPercentage", AttributeValueUpdate.builder()
+                .value(AttributeValue.builder().n(String.valueOf(progressPercentage)).build())
+                .action(AttributeAction.PUT)
+                .build());
+            
+            UpdateItemRequest request = UpdateItemRequest.builder()
+                .tableName(ANALYSIS_RESULTS_TABLE)
+                .key(key)
+                .attributeUpdates(updates)
+                .build();
+            
+            dynamoDbClient.updateItem(request);
+            log.info("Updated analysis progress for analysisId: {} to status: {}", analysisId, status);
+            
+        } catch (Exception e) {
+            log.error("Failed to update analysis progress: {}", e.getMessage(), e);
+            // Don't throw exception to prevent Lambda failure
+        }
+    }
+    
+    /**
      * Update analysis results table with suggestion summary
      */
     private void updateAnalysisResults(String analysisId, String sessionId, 
@@ -138,6 +192,23 @@ public class DynamoDBService {
             
         } catch (Exception e) {
             log.error("Failed to store suggestion for issue {}: {}", suggestion.getIssueId(), e.getMessage(), e);
+        }
+    }
+    
+    /**
+     * Calculate progress percentage based on status
+     */
+    private int calculateProgressPercentage(String status) {
+        switch (status.toLowerCase()) {
+            case "suggestions_started":
+                return 70;
+            case "suggestions_in_progress":
+                return 80;
+            case "suggestions_complete":
+            case "completed":
+                return 100;
+            default:
+                return 75; // Default for unknown status
         }
     }
 }

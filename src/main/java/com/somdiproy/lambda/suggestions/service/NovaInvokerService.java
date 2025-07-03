@@ -2,21 +2,26 @@
 package com.somdiproy.lambda.suggestions.service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import software.amazon.awssdk.core.SdkBytes;
-import software.amazon.awssdk.services.bedrockruntime.BedrockRuntimeClient;
-import software.amazon.awssdk.services.bedrockruntime.model.InvokeModelRequest;
-import software.amazon.awssdk.services.bedrockruntime.model.InvokeModelResponse;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import software.amazon.awssdk.core.SdkBytes;
+import software.amazon.awssdk.core.exception.SdkClientException;
+import software.amazon.awssdk.core.exception.SdkServiceException;
+import software.amazon.awssdk.services.bedrockruntime.BedrockRuntimeClient;
+import software.amazon.awssdk.services.bedrockruntime.model.*;
+
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Service for invoking Amazon Nova models via Bedrock
+ * Enhanced Service for invoking Amazon Nova models via Bedrock with robust retry logic
  */
 public class NovaInvokerService {
     
-    private static final org.slf4j.Logger log = org.slf4j.LoggerFactory.getLogger(NovaInvokerService.class);
+    private static final Logger log = LoggerFactory.getLogger(NovaInvokerService.class);
     
     private final BedrockRuntimeClient bedrockClient;
     private final ObjectMapper objectMapper;
@@ -24,6 +29,33 @@ public class NovaInvokerService {
     // Nova Premier pricing (per 1M tokens)
     private static final double INPUT_TOKEN_COST = 0.0008; // $0.80 per 1M input tokens
     private static final double OUTPUT_TOKEN_COST = 0.0032; // $3.20 per 1M output tokens
+    
+    // Retry configuration with exponential backoff
+    private static final int MAX_RETRIES = Integer.parseInt(System.getenv().getOrDefault("MAX_RETRIES", "5"));
+    private static final long MIN_RETRY_DELAY_MS = Long.parseLong(System.getenv().getOrDefault("RETRY_BASE_DELAY_MS", "1000"));
+    private static final long MAX_RETRY_DELAY_MS = Long.parseLong(System.getenv().getOrDefault("RETRY_MAX_DELAY_MS", "60000"));
+    private static final double JITTER_FACTOR = 0.25; // 25% jitter
+    
+    // Rate limiting configuration for Nova Premier
+    private static final long MIN_CALL_INTERVAL_MS = 500; // 2 calls per second max
+    private static final int RATE_LIMIT_WINDOW_SIZE = 10; // Track last 10 calls
+    private final LinkedList<Long> callTimestamps = new LinkedList<>();
+    private final Map<String, Long> lastCallTime = new ConcurrentHashMap<>();
+    
+    // Circuit breaker state
+    private enum CircuitState { CLOSED, OPEN, HALF_OPEN }
+    private volatile CircuitState circuitState = CircuitState.CLOSED;
+    private final AtomicInteger consecutiveFailures = new AtomicInteger(0);
+    private final AtomicLong circuitOpenTime = new AtomicLong(0);
+    private static final int FAILURE_THRESHOLD = 3;
+    private static final long CIRCUIT_RESET_TIMEOUT_MS = 30000; // 30 seconds
+    private static final boolean CIRCUIT_BREAKER_ENABLED = Boolean.parseBoolean(
+        System.getenv().getOrDefault("CIRCUIT_BREAKER_ENABLED", "true"));
+    
+    // Metrics tracking
+    private final Map<String, AtomicInteger> callCount = new ConcurrentHashMap<>();
+    private final Map<String, AtomicLong> totalLatency = new ConcurrentHashMap<>();
+    private final Map<String, AtomicInteger> throttleCount = new ConcurrentHashMap<>();
     
     public NovaInvokerService(String region) {
         this.bedrockClient = BedrockRuntimeClient.builder()
@@ -33,91 +65,237 @@ public class NovaInvokerService {
     }
     
     /**
-     * Invoke Nova model with text prompt
+     * Invoke Nova model with comprehensive retry logic and throttling protection
      */
     public NovaResponse invokeNova(String modelId, String prompt, int maxTokens, 
-                                   double temperature, double topP) {
-        try {
-            // Build request payload for Nova models
-            Map<String, Object> requestBody = new HashMap<>();
-            
-            // Nova-specific message format
-            List<Map<String, Object>> messages = List.of(
-            	    Map.of(
-            	        "role", "user",
-            	        "content", List.of(
-            	            Map.of("text", prompt)
-            	        )
-            	    )
-            	);
-            
-				requestBody.put("messages", messages);
-				// FIXED: Removed max_tokens and temperature from root level
-
-				// Nova-specific inference configuration
-				// All model parameters must be inside inferenceConfig only
-				// Nova-specific inference configuration
-				// All model parameters must be inside inferenceConfig only
-				Map<String, Object> inferenceConfig = new HashMap<>();
-				inferenceConfig.put("maxTokens", maxTokens); // Changed from "max_tokens" to "maxTokens"
-				inferenceConfig.put("temperature", temperature);
-				// Note: top_p is not supported in Nova models
-				// Note: top_p is not supported in Nova models
-				requestBody.put("inferenceConfig", inferenceConfig);
-
-				String requestJson = objectMapper.writeValueAsString(requestBody);
-				log.debug("Nova API Request: {}", requestJson);
-            
-            // Create Bedrock request
-            InvokeModelRequest request = InvokeModelRequest.builder()
-                .modelId(modelId)
-                .body(SdkBytes.fromUtf8String(requestJson))
-                .contentType("application/json")
-                .accept("application/json")
-                .build();
-            
-            // Execute request
-            InvokeModelResponse response = bedrockClient.invokeModel(request);
-            String responseBody = response.body().asUtf8String();
-            log.debug("Nova API Response: {}", responseBody);
-            
-            // Parse Nova response
-            Map<String, Object> responseMap = objectMapper.readValue(responseBody, Map.class);
-            
-            // Extract content from Nova response format
-            String responseText = extractResponseText(responseMap);
-            
-            // Extract token usage
-            Map<String, Object> usage = (Map<String, Object>) responseMap.get("usage");
-            int inputTokens = usage != null ? (Integer) usage.getOrDefault("input_tokens", 0) : 0;
-            int outputTokens = usage != null ? (Integer) usage.getOrDefault("output_tokens", 0) : 0;
-            
-            // Calculate cost
-            double cost = calculateCost(inputTokens, outputTokens);
-            
-            log.info("Nova {} invocation successful - Tokens: {}, Cost: ${:.6f}", 
-                    modelId, inputTokens + outputTokens, cost);
-            
-            return NovaResponse.builder()
-                .responseText(responseText)
-                .inputTokens(inputTokens)
-                .outputTokens(outputTokens)
-                .totalTokens(inputTokens + outputTokens)
-                .estimatedCost(cost)
-                .modelId(modelId)
-                .successful(true)
-                .timestamp(System.currentTimeMillis())
-                .build();
-            
-        } catch (Exception e) {
-            log.error("Failed to invoke Nova model: " + e.getMessage(), e);
-            return NovaResponse.builder()
-                .successful(false)
-                .errorMessage("Failed to invoke Nova: " + e.getMessage())
-                .modelId(modelId)
-                .timestamp(System.currentTimeMillis())
-                .build();
+                                   double temperature, double topP) throws NovaInvokerException {
+        String callKey = modelId + "-" + Thread.currentThread().getName();
+        long startTime = System.currentTimeMillis();
+        
+        // Check circuit breaker state
+        if (CIRCUIT_BREAKER_ENABLED) {
+            checkCircuitBreaker();
         }
+        
+        Exception lastException = null;
+        
+        for (int attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+            try {
+                // Enforce rate limiting before each attempt
+                enforceRateLimit(callKey);
+                
+                // Update call metrics
+                updateCallMetrics(callKey);
+                
+                // Build request payload for Nova models
+                Map<String, Object> requestBody = buildRequestBody(prompt, maxTokens, temperature);
+                String requestJson = objectMapper.writeValueAsString(requestBody);
+                
+                if (attempt > 1) {
+                    log.info("Retry attempt {}/{} for Nova {} invocation", attempt, MAX_RETRIES, modelId);
+                }
+                
+                log.debug("Nova API Request (attempt {}): {}", attempt, requestJson);
+                
+                // Create Bedrock request
+                InvokeModelRequest request = InvokeModelRequest.builder()
+                    .modelId(modelId)
+                    .body(SdkBytes.fromUtf8String(requestJson))
+                    .contentType("application/json")
+                    .accept("application/json")
+                    .build();
+                
+                // Execute request
+                InvokeModelResponse response = bedrockClient.invokeModel(request);
+                String responseBody = response.body().asUtf8String();
+                log.debug("Nova API Response: {}", responseBody);
+                
+                // Parse successful response
+                NovaResponse novaResponse = parseResponse(responseBody, modelId);
+                
+                // Reset circuit breaker on success
+                if (CIRCUIT_BREAKER_ENABLED && circuitState != CircuitState.CLOSED) {
+                    log.info("Circuit breaker: resetting to CLOSED state after successful call");
+                    circuitState = CircuitState.CLOSED;
+                    consecutiveFailures.set(0);
+                }
+                
+                // Log success metrics
+                long latency = System.currentTimeMillis() - startTime;
+                logMetrics(modelId, novaResponse.getTotalTokens(), novaResponse.getEstimatedCost(), 
+                          latency, attempt - 1, true);
+                
+                return novaResponse;
+                
+            } catch (ThrottlingException e) {
+                // Rate limit exceeded - retry with exponential backoff
+                log.warn("Rate limit exceeded for {}, attempt {}/{}: {}", 
+                        modelId, attempt, MAX_RETRIES, e.getMessage());
+                lastException = e;
+                throttleCount.computeIfAbsent(modelId, k -> new AtomicInteger()).incrementAndGet();
+                
+                if (attempt < MAX_RETRIES) {
+                    long delay = calculateExponentialBackoffDelay(attempt);
+                    log.info("Throttled - waiting {}ms before retry attempt {}", delay, attempt + 1);
+                    
+                    try {
+                        Thread.sleep(delay);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw new NovaInvokerException("Interrupted during retry", ie);
+                    }
+                }
+                
+            } catch (ModelTimeoutException e) {
+                // Model timeout - retry with backoff
+                log.warn("Model timeout for {}, attempt {}/{}", modelId, attempt, MAX_RETRIES);
+                lastException = e;
+                
+                if (attempt < MAX_RETRIES) {
+                    long delay = calculateExponentialBackoffDelay(attempt);
+                    try {
+                        Thread.sleep(delay);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw new NovaInvokerException("Interrupted during retry", ie);
+                    }
+                }
+                
+            } catch (BedrockRuntimeException e) {
+                // Check if it's a retryable error
+                if (isRetryableError(e) && attempt < MAX_RETRIES) {
+                    log.warn("Bedrock service error for {}, attempt {}/{}: {}", 
+                            modelId, attempt, MAX_RETRIES, e.getMessage());
+                    lastException = e;
+                    
+                    long delay = calculateExponentialBackoffDelay(attempt);
+                    try {
+                        Thread.sleep(delay);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw new NovaInvokerException("Interrupted during retry", ie);
+                    }
+                } else {
+                    // Non-retryable error
+                    handleCircuitBreakerFailure();
+                    throw new NovaInvokerException("Bedrock service error: " + e.getMessage(), e);
+                }
+                
+            } catch (SdkServiceException e) {
+                // AWS service error - check if retryable
+                if (e.statusCode() >= 500 && attempt < MAX_RETRIES) {
+                    log.warn("AWS service error (5xx) for {}, attempt {}/{}", 
+                            modelId, attempt, MAX_RETRIES);
+                    lastException = e;
+                    
+                    long delay = calculateExponentialBackoffDelay(attempt);
+                    try {
+                        Thread.sleep(delay);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw new NovaInvokerException("Interrupted during retry", ie);
+                    }
+                } else {
+                    handleCircuitBreakerFailure();
+                    throw new NovaInvokerException("AWS service error: " + e.getMessage(), e);
+                }
+                
+            } catch (SdkClientException e) {
+                // Client-side error (network, config, etc.) - retry for network issues
+                log.error("Client error for {}, attempt {}/{}: {}", 
+                         modelId, attempt, MAX_RETRIES, e.getMessage());
+                lastException = e;
+                
+                if (attempt < MAX_RETRIES && isNetworkError(e)) {
+                    long delay = calculateExponentialBackoffDelay(attempt);
+                    try {
+                        Thread.sleep(delay);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw new NovaInvokerException("Interrupted during retry", ie);
+                    }
+                } else {
+                    handleCircuitBreakerFailure();
+                    throw new NovaInvokerException("Client error: " + e.getMessage(), e);
+                }
+                
+            } catch (Exception e) {
+                // Unexpected error
+                log.error("Unexpected error for {}: {}", modelId, e.getMessage(), e);
+                handleCircuitBreakerFailure();
+                throw new NovaInvokerException("Unexpected error: " + e.getMessage(), e);
+            }
+        }
+        
+        // All retries exhausted
+        handleCircuitBreakerFailure();
+        log.error("All {} retry attempts failed for Nova {}", MAX_RETRIES, modelId);
+        
+        // Log failure metrics
+        long latency = System.currentTimeMillis() - startTime;
+        logMetrics(modelId, 0, 0.0, latency, MAX_RETRIES, false);
+        
+        throw new NovaInvokerException("All retry attempts failed", lastException);
+    }
+    
+    /**
+     * Build request body for Nova models
+     */
+    private Map<String, Object> buildRequestBody(String prompt, int maxTokens, double temperature) {
+        Map<String, Object> requestBody = new HashMap<>();
+        
+        // Nova-specific message format
+        List<Map<String, Object>> messages = List.of(
+            Map.of(
+                "role", "user",
+                "content", List.of(
+                    Map.of("text", prompt)
+                )
+            )
+        );
+        
+        requestBody.put("messages", messages);
+        
+        // Nova-specific inference configuration
+        Map<String, Object> inferenceConfig = new HashMap<>();
+        inferenceConfig.put("maxTokens", maxTokens);
+        inferenceConfig.put("temperature", temperature);
+        // Note: top_p is not supported in Nova models
+        requestBody.put("inferenceConfig", inferenceConfig);
+        
+        return requestBody;
+    }
+    
+    /**
+     * Parse Nova response
+     */
+    private NovaResponse parseResponse(String responseBody, String modelId) throws Exception {
+        Map<String, Object> responseMap = objectMapper.readValue(responseBody, Map.class);
+        
+        // Extract content from Nova response format
+        String responseText = extractResponseText(responseMap);
+        
+        // Extract token usage
+        Map<String, Object> usage = (Map<String, Object>) responseMap.get("usage");
+        int inputTokens = usage != null ? (Integer) usage.getOrDefault("input_tokens", 0) : 0;
+        int outputTokens = usage != null ? (Integer) usage.getOrDefault("output_tokens", 0) : 0;
+        
+        // Calculate cost
+        double cost = calculateCost(inputTokens, outputTokens);
+        
+        log.info("Nova {} invocation successful - Tokens: {}, Cost: ${:.6f}", 
+                modelId, inputTokens + outputTokens, cost);
+        
+        return NovaResponse.builder()
+            .responseText(responseText)
+            .inputTokens(inputTokens)
+            .outputTokens(outputTokens)
+            .totalTokens(inputTokens + outputTokens)
+            .estimatedCost(cost)
+            .modelId(modelId)
+            .successful(true)
+            .timestamp(System.currentTimeMillis())
+            .build();
     }
     
     /**
@@ -147,12 +325,180 @@ public class NovaInvokerService {
     }
     
     /**
+     * Calculate exponential backoff delay with jitter
+     */
+    private long calculateExponentialBackoffDelay(int attempt) {
+        // Exponential backoff: 2^(attempt-1) * base delay
+        long exponentialDelay = (long) Math.pow(2, attempt - 1) * MIN_RETRY_DELAY_MS;
+        
+        // Cap at maximum delay
+        long delay = Math.min(exponentialDelay, MAX_RETRY_DELAY_MS);
+        
+        // Add jitter (0-25% of delay) to prevent thundering herd
+        long jitter = (long) (delay * JITTER_FACTOR * Math.random());
+        
+        return delay + jitter;
+    }
+    
+    /**
+     * Enforce rate limiting with sliding window
+     */
+    private void enforceRateLimit(String callKey) throws InterruptedException {
+        synchronized (callTimestamps) {
+            long currentTime = System.currentTimeMillis();
+            
+            // Remove timestamps older than the window
+            while (!callTimestamps.isEmpty() && 
+                   currentTime - callTimestamps.getFirst() > RATE_LIMIT_WINDOW_SIZE * MIN_CALL_INTERVAL_MS) {
+                callTimestamps.removeFirst();
+            }
+            
+            // If we've made too many calls recently, wait
+            if (callTimestamps.size() >= RATE_LIMIT_WINDOW_SIZE) {
+                long oldestCall = callTimestamps.getFirst();
+                long waitTime = (oldestCall + RATE_LIMIT_WINDOW_SIZE * MIN_CALL_INTERVAL_MS) - currentTime;
+                if (waitTime > 0) {
+                    log.info("Rate limiting: waiting {}ms before next call", waitTime);
+                    Thread.sleep(waitTime);
+                    // Recursive call to recheck after waiting
+                    enforceRateLimit(callKey);
+                    return;
+                }
+            }
+            
+            // Add current timestamp
+            callTimestamps.addLast(currentTime);
+            
+            // Also enforce minimum interval between consecutive calls
+            Long lastCall = lastCallTime.get(callKey);
+            if (lastCall != null) {
+                long timeSinceLastCall = currentTime - lastCall;
+                if (timeSinceLastCall < MIN_CALL_INTERVAL_MS) {
+                    Thread.sleep(MIN_CALL_INTERVAL_MS - timeSinceLastCall);
+                }
+            }
+            lastCallTime.put(callKey, System.currentTimeMillis());
+        }
+    }
+    
+    /**
+     * Check circuit breaker state
+     */
+    private void checkCircuitBreaker() throws NovaInvokerException {
+        if (circuitState == CircuitState.OPEN) {
+            long timeSinceOpen = System.currentTimeMillis() - circuitOpenTime.get();
+            if (timeSinceOpen > CIRCUIT_RESET_TIMEOUT_MS) {
+                log.info("Circuit breaker: transitioning to HALF_OPEN state");
+                circuitState = CircuitState.HALF_OPEN;
+            } else {
+                throw new NovaInvokerException(
+                    String.format("Circuit breaker is OPEN. Service unavailable for %d ms", 
+                                CIRCUIT_RESET_TIMEOUT_MS - timeSinceOpen));
+            }
+        }
+    }
+    
+    /**
+     * Handle circuit breaker failure
+     */
+    private void handleCircuitBreakerFailure() {
+        if (!CIRCUIT_BREAKER_ENABLED) {
+            return;
+        }
+        
+        int failures = consecutiveFailures.incrementAndGet();
+        
+        if (failures >= FAILURE_THRESHOLD && circuitState != CircuitState.OPEN) {
+            log.warn("Circuit breaker: opening circuit after {} consecutive failures", failures);
+            circuitState = CircuitState.OPEN;
+            circuitOpenTime.set(System.currentTimeMillis());
+        }
+    }
+    
+    /**
+     * Check if error is retryable
+     */
+    private boolean isRetryableError(BedrockRuntimeException e) {
+        // Retry on throttling, timeouts, and 5xx errors
+        return e instanceof ThrottlingException ||
+               e instanceof ModelTimeoutException ||
+               (e.statusCode() >= 500 && e.statusCode() < 600) ||
+               e.statusCode() == 429; // Too Many Requests
+    }
+    
+    /**
+     * Check if it's a network error
+     */
+    private boolean isNetworkError(SdkClientException e) {
+        String message = e.getMessage().toLowerCase();
+        return message.contains("timeout") ||
+               message.contains("connection") ||
+               message.contains("network");
+    }
+    
+    /**
+     * Update call metrics for monitoring
+     */
+    private void updateCallMetrics(String callKey) {
+        callCount.computeIfAbsent(callKey, k -> new AtomicInteger()).incrementAndGet();
+    }
+    
+    /**
+     * Log metrics for monitoring
+     */
+    private void logMetrics(String modelId, int tokens, double cost, long latency, 
+                           int retryCount, boolean success) {
+        log.info("MONITORING_METRIC|ModelId:{}|Tokens:{}|Cost:{}|Latency:{}|RetryCount:{}|Success:{}|CircuitState:{}",
+                modelId, tokens, cost, latency, retryCount, success, circuitState);
+        
+        // Update latency tracking
+        totalLatency.computeIfAbsent(modelId, k -> new AtomicLong()).addAndGet(latency);
+    }
+    
+    /**
      * Calculate estimated cost based on token usage
      */
     private double calculateCost(int inputTokens, int outputTokens) {
         double inputCost = (inputTokens / 1_000_000.0) * INPUT_TOKEN_COST;
         double outputCost = (outputTokens / 1_000_000.0) * OUTPUT_TOKEN_COST;
         return inputCost + outputCost;
+    }
+    
+    /**
+     * Get call statistics for monitoring
+     */
+    public Map<String, Object> getStatistics() {
+        Map<String, Object> stats = new HashMap<>();
+        stats.put("callCounts", new HashMap<>(callCount));
+        stats.put("throttleCounts", new HashMap<>(throttleCount));
+        stats.put("circuitState", circuitState.toString());
+        stats.put("consecutiveFailures", consecutiveFailures.get());
+        
+        // Calculate average latencies
+        Map<String, Double> avgLatencies = new HashMap<>();
+        for (Map.Entry<String, AtomicLong> entry : totalLatency.entrySet()) {
+            String model = entry.getKey();
+            long totalLat = entry.getValue().get();
+            int calls = callCount.getOrDefault(model, new AtomicInteger(0)).get();
+            if (calls > 0) {
+                avgLatencies.put(model, (double) totalLat / calls);
+            }
+        }
+        stats.put("averageLatencies", avgLatencies);
+        
+        return stats;
+    }
+    
+    /**
+     * Reset statistics
+     */
+    public void resetStatistics() {
+        callCount.clear();
+        throttleCount.clear();
+        totalLatency.clear();
+        consecutiveFailures.set(0);
+        callTimestamps.clear();
+        lastCallTime.clear();
     }
     
     /**
@@ -229,5 +575,18 @@ public class NovaInvokerService {
         public long getTimestamp() { return timestamp; }
         public String getErrorMessage() { return errorMessage; }
         public Map<String, Object> getMetadata() { return metadata; }
+    }
+    
+    /**
+     * Custom exception for Nova invocation errors
+     */
+    public static class NovaInvokerException extends Exception {
+        public NovaInvokerException(String message) {
+            super(message);
+        }
+        
+        public NovaInvokerException(String message, Throwable cause) {
+            super(message, cause);
+        }
     }
 }
