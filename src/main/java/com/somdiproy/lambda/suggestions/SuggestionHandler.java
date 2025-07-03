@@ -18,8 +18,8 @@ import java.util.stream.Collectors;
 
 /**
  * Enhanced Lambda function for Nova Premier suggestion generation with batch
- * processing Handler:
- * com.somdiproy.lambda.suggestions.SuggestionHandler::handleRequest
+ * processing and hybrid model support
+ * Handler: com.somdiproy.lambda.suggestions.SuggestionHandler::handleRequest
  */
 public class SuggestionHandler implements RequestHandler<SuggestionRequest, SuggestionResponse> {
 	private static final org.slf4j.Logger log = org.slf4j.LoggerFactory.getLogger(SuggestionHandler.class);
@@ -28,8 +28,12 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 	private final NovaInvokerService novaInvoker;
 	private final DynamoDBService dynamoDBService;
 
-	// Configuration from environment variables
-	private static final String MODEL_ID = System.getenv("MODEL_ID"); // amazon.nova-pro-v1:0
+	// Configuration from environment variables with hybrid model support
+	private static final String DEFAULT_MODEL_ID = System.getenv("MODEL_ID"); // amazon.nova-pro-v1:0
+	private static final String NOVA_LITE_MODEL_ID = "amazon.nova-lite-v1:0";
+	private static final boolean TEMPLATE_MODE_ENABLED = Boolean.parseBoolean(System.getenv("TEMPLATE_MODE_ENABLED"));
+	private static final String MODEL_ID = DEFAULT_MODEL_ID; // Primary model reference
+	
 	private static final String BEDROCK_REGION = System.getenv("BEDROCK_REGION"); // us-east-1
 	private static final int MAX_TOKENS = Integer.parseInt(System.getenv("MAX_TOKENS")); // 8000
 
@@ -57,6 +61,56 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 		initializeExecutorService();
 	}
 
+	/**
+	 * Model selection strategy for hybrid approach
+	 */
+	private String selectModel(SuggestionRequest request) {
+		// Check if hybrid mode is enabled via request
+		if (request != null && request.isHybridMode()) {
+			return request.getEffectiveModelId();
+		}
+		
+		// Default to request-based selection if available
+		String requestedModel = request != null ? request.getModelId() : null;
+		if (requestedModel != null) {
+			return requestedModel;
+		}
+		
+		// Check if template mode is enabled globally
+		if (TEMPLATE_MODE_ENABLED && Math.random() < 0.09) {
+			return "TEMPLATE_MODE";
+		}
+		
+		// Default to Nova Lite for most cases (90%)
+		return Math.random() < 0.90 ? NOVA_LITE_MODEL_ID : DEFAULT_MODEL_ID;
+	}
+
+	/**
+	 * Determine which model to use for a specific issue based on hybrid strategy
+	 */
+	private String determineModelForIssue(Map<String, Object> issue) {
+		String severity = (String) issue.getOrDefault("severity", "MEDIUM");
+		String category = (String) issue.getOrDefault("category", "quality");
+		
+		// 1% Nova Premier for CRITICAL security issues only
+		if ("CRITICAL".equalsIgnoreCase(severity) && "security".equalsIgnoreCase(category)) {
+			return Math.random() < 0.01 ? DEFAULT_MODEL_ID : NOVA_LITE_MODEL_ID;
+		}
+		
+		// 90% Nova Lite for most issues
+		if (Math.random() < 0.90) {
+			return NOVA_LITE_MODEL_ID;
+		}
+		
+		// 9% Enhanced Templates for fallback
+		if (Math.random() < 0.99) { // 9% of remaining 10%
+			return "TEMPLATE_MODE";
+		}
+		
+		// Fallback to Nova Lite (remaining 1%)
+		return NOVA_LITE_MODEL_ID;
+	}
+
 	private void initializeExecutorService() {
 		synchronized (executorLock) {
 			if (executorService == null || executorService.isShutdown()) {
@@ -74,7 +128,7 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 	@Override
 	public SuggestionResponse handleRequest(SuggestionRequest request, Context context) {
 		LambdaLogger logger = context.getLogger();
-		logger.log("🚀 Starting Nova Premier suggestion generation for analysis: " + request.getAnalysisId());
+		logger.log("🚀 Starting hybrid suggestion generation for analysis: " + request.getAnalysisId());
 
 		SuggestionResponse.ProcessingTime processingTime = new SuggestionResponse.ProcessingTime();
 		processingTime.startTime = System.currentTimeMillis();
@@ -290,6 +344,7 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 		long progressiveDelay = baseDelay + (batchIndex * 500L); // Add 500ms per batch
 		return Math.min(progressiveDelay, 10000L); // Cap at 10 seconds
 	}
+	
 	/**
 	 * Calculate adaptive batch delay based on current load and Nova API performance
 	 */
@@ -308,6 +363,7 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 	    
 	    return Math.min(progressiveDelay, 30000L); // Cap at 30s
 	}
+	
 	/**
 	 * Check if we should slow down based on statistics
 	 */
@@ -369,12 +425,16 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 	}
 
 	/**
-	 * Generate suggestion for a single issue with error handling
+	 * Generate suggestion for a single issue with hybrid model selection
 	 */
 	private DeveloperSuggestion generateSuggestionForIssue(Map<String, Object> issue, LambdaLogger logger) {
 		try {
 			String issueId = (String) issue.get("id");
 			logger.log("🔍 Generating suggestion for issue: " + issueId);
+
+			// Determine which model to use for this issue
+			String selectedModel = determineModelForIssue(issue);
+			logger.log("🎯 Using model: " + selectedModel + " for issue: " + issueId);
 
 			// Build optimized prompt
 			String prompt = buildSuggestionPrompt(issue);
@@ -383,18 +443,24 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 			int estimatedTokens = TokenOptimizer.estimateTokens(prompt);
 			int adjustedMaxTokens = Math.min(MAX_TOKENS, TOKEN_BUDGET / 10); // Limit per issue
 
-			// Call Nova Premier with retry logic handled by NovaInvokerService
-			NovaInvokerService.NovaResponse novaResponse = novaInvoker.invokeNova(MODEL_ID, prompt, adjustedMaxTokens,
-					0.3, 0.9);
+			// Call appropriate Nova model or template with hybrid strategy
+			NovaInvokerService.NovaResponse novaResponse;
+			if ("TEMPLATE_MODE".equals(selectedModel)) {
+				// Use template-based response
+				novaResponse = createSimpleTemplateResponse(prompt, adjustedMaxTokens);
+			} else {
+				// Use regular Nova model
+				novaResponse = novaInvoker.invokeNova(selectedModel, prompt, adjustedMaxTokens, 0.3, 0.9);
+			}
 
 			if (!novaResponse.isSuccessful()) {
-				logger.log("❌ Nova Premier call failed for issue " + issueId + ": " + novaResponse.getErrorMessage());
+				logger.log("❌ Model call failed for issue " + issueId + ": " + novaResponse.getErrorMessage());
 				return createFallbackSuggestion(issueId, issue, 0, 0.0);
 			}
 
 			// Parse response
 			return parseSuggestionResponse(issueId, novaResponse.getResponseText(), novaResponse.getTotalTokens(),
-					novaResponse.getEstimatedCost(), issue, logger);
+					novaResponse.getEstimatedCost(), issue, logger, selectedModel);
 
 		} catch (NovaInvokerService.NovaInvokerException e) {
 			// Handle circuit breaker or other critical errors
@@ -405,6 +471,86 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 			log.error("Suggestion generation error details:", e);
 			return createFallbackSuggestion((String) issue.get("id"), issue, 0, 0.0);
 		}
+	}
+
+	/**
+	 * Create a simple template response when TEMPLATE_MODE is selected
+	 */
+	private NovaInvokerService.NovaResponse createSimpleTemplateResponse(String prompt, int maxTokens) {
+		String templateResponse = generateTemplateBasedSuggestion(prompt);
+		
+		// Create a simple response object
+		return new NovaInvokerService.NovaResponse(
+			templateResponse,
+			50, // estimated input tokens
+			100, // estimated output tokens
+			150, // total tokens
+			0.0001, // minimal cost
+			"TEMPLATE_MODE",
+			true,
+			System.currentTimeMillis(),
+			null
+		);
+	}
+
+	/**
+	 * Generate template-based suggestion from prompt analysis
+	 */
+	private String generateTemplateBasedSuggestion(String prompt) {
+		String lowerPrompt = prompt.toLowerCase();
+		
+		if (lowerPrompt.contains("sql injection") || lowerPrompt.contains("sqli")) {
+			return """
+			{
+			  "immediateFix": {
+			    "title": "Use Parameterized Queries",
+			    "searchCode": "String query = \\"SELECT * FROM users WHERE id = '\\" + userId + \\"'\\";",
+			    "replaceCode": "String query = \\"SELECT * FROM users WHERE id = ?\\"; PreparedStatement stmt = connection.prepareStatement(query); stmt.setString(1, userId);",
+			    "explanation": "Parameterized queries prevent SQL injection by separating code from data."
+			  },
+			  "bestPractice": {
+			    "title": "Always Use Prepared Statements",
+			    "code": "PreparedStatement stmt = connection.prepareStatement(\\"SELECT * FROM users WHERE id = ?\\"); stmt.setString(1, userId);",
+			    "benefits": ["Prevents SQL injection", "Better performance", "Cleaner code"]
+			  },
+			  "testing": {
+			    "testCase": "@Test public void testSqlInjectionPrevention() { String maliciousInput = \\"'; DROP TABLE users; --\\"; /* Test should not affect database */ }",
+			    "validationSteps": ["Test with malicious input", "Verify database integrity", "Check query logs"]
+			  },
+			  "prevention": {
+			    "guidelines": ["Always use parameterized queries", "Validate input length and format", "Use least privilege database accounts"],
+			    "tools": [{"name": "SonarQube", "description": "Static analysis for SQL injection detection"}],
+			    "codeReviewChecklist": ["Check for string concatenation in SQL", "Verify parameterized queries usage", "Review input validation"]
+			  }
+			}
+			""";
+		}
+		
+		// Default template for other issues
+		return """
+		{
+		  "immediateFix": {
+		    "title": "Review and Apply Best Practices",
+		    "searchCode": "// Review the identified code section",
+		    "replaceCode": "// Apply appropriate security measures and best practices",
+		    "explanation": "This issue requires manual review and application of security best practices."
+		  },
+		  "bestPractice": {
+		    "title": "Follow Security Guidelines",
+		    "code": "// Implement according to OWASP guidelines",
+		    "benefits": ["Improved security", "Better maintainability", "Reduced vulnerabilities"]
+		  },
+		  "testing": {
+		    "testCase": "// Add appropriate unit tests",
+		    "validationSteps": ["Review code changes", "Test functionality", "Verify security measures"]
+		  },
+		  "prevention": {
+		    "guidelines": ["Follow OWASP guidelines", "Regular security reviews", "Use static analysis tools"],
+		    "tools": [{"name": "Static Analysis", "description": "Automated security scanning"}],
+		    "codeReviewChecklist": ["Security implications", "Best practices compliance", "Test coverage"]
+		  }
+		}
+		""";
 	}
 
 	private String buildSuggestionPrompt(Map<String, Object> issue) {
@@ -453,7 +599,7 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 	}
 
 	private DeveloperSuggestion parseSuggestionResponse(String issueId, String response, int tokensUsed, double cost,
-			Map<String, Object> originalIssue, LambdaLogger logger) {
+			Map<String, Object> originalIssue, LambdaLogger logger, String modelUsed) {
 		try {
 			// Extract JSON from response
 			String jsonContent = extractJsonFromResponse(response);
@@ -465,7 +611,7 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 					.language((String) originalIssue.get("language")).immediateFix(parseImmediateFix(suggestionData))
 					.bestPractice(parseBestPractice(suggestionData)).testing(parseTesting(suggestionData))
 					.prevention(parsePrevention(suggestionData)).tokensUsed(tokensUsed).cost(cost)
-					.timestamp(System.currentTimeMillis()).modelUsed(MODEL_ID).build();
+					.timestamp(System.currentTimeMillis()).modelUsed(modelUsed).build();
 
 		} catch (Exception e) {
 			logger.log("❌ Error parsing suggestion response for issue " + issueId + ": " + e.getMessage());
@@ -568,7 +714,7 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 
 	private DeveloperSuggestion createFallbackSuggestion(String issueId, Map<String, Object> issue, int tokensUsed,
 			double cost) {
-// Create basic fix guidance based on issue type
+		// Create basic fix guidance based on issue type
 		String issueType = (String) issue.get("type");
 		String codeSnippet = (String) issue.getOrDefault("codeSnippet", "");
 
@@ -587,7 +733,7 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 				.issueCategory((String) issue.get("category")).issueSeverity((String) issue.get("severity"))
 				.language((String) issue.get("language")).immediateFix(fallbackFix).bestPractice(fallbackPractice)
 				.tokensUsed(tokensUsed).cost(cost).timestamp(System.currentTimeMillis())
-				.modelUsed(MODEL_ID + "-fallback").build();
+				.modelUsed(DEFAULT_MODEL_ID + "-fallback").build();
 	}
 
 	private String generateBasicFixGuidance(String issueType) {
@@ -651,7 +797,8 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 	private Map<String, Object> buildMetadata(int totalTokens, double totalCost,
 			SuggestionResponse.ProcessingTime processingTime) {
 		Map<String, Object> metadata = new HashMap<>();
-		metadata.put("modelUsed", MODEL_ID);
+		metadata.put("modelUsed", DEFAULT_MODEL_ID);
+		metadata.put("hybridModeEnabled", TEMPLATE_MODE_ENABLED);
 		metadata.put("totalTokensUsed", totalTokens);
 		metadata.put("totalCost", totalCost);
 		metadata.put("timestamp", System.currentTimeMillis());

@@ -36,15 +36,83 @@ public class SuggestionRequest {
     
     @JsonProperty("metadata")
     private Map<String, Object> metadata;
+
+    // New hybrid strategy fields
+    @JsonProperty("modelId")
+    private String modelId; // "nova-lite", "nova-premier", or "template"
+
+    @JsonProperty("issueSeverity") 
+    private String issueSeverity; // "LOW", "MEDIUM", "HIGH", "CRITICAL"
+
+    @JsonProperty("strategy")
+    private String strategy = "hybrid"; // Strategy identifier
+
+    @JsonProperty("processingMode")
+    private String processingMode; // "standard", "fallback", "template"
     
     // Constructors
     public SuggestionRequest() {}
     
-    // Validation
+    public String getModelId() {
+		return modelId;
+	}
+
+	public void setModelId(String modelId) {
+		this.modelId = modelId;
+	}
+
+	public String getIssueSeverity() {
+		return issueSeverity;
+	}
+
+	public void setIssueSeverity(String issueSeverity) {
+		this.issueSeverity = issueSeverity;
+	}
+
+	public String getStrategy() {
+		return strategy;
+	}
+
+	public void setStrategy(String strategy) {
+		this.strategy = strategy;
+	}
+
+	public String getProcessingMode() {
+		return processingMode;
+	}
+
+	public void setProcessingMode(String processingMode) {
+		this.processingMode = processingMode;
+	}
+
+	// Validation
     public boolean isValid() {
         return sessionId != null && !sessionId.trim().isEmpty() &&
                analysisId != null && !analysisId.trim().isEmpty() &&
                issues != null && !issues.isEmpty();
+    }
+
+    // Helper method to determine if hybrid strategy should be used
+    public boolean isHybridMode() {
+        return "hybrid".equals(strategy) || modelId != null;
+    }
+
+    // Helper method to get effective model ID with fallback
+    public String getEffectiveModelId() {
+        if (modelId != null && !modelId.trim().isEmpty()) {
+            return modelId;
+        }
+        
+        // Determine based on issue severity if not explicitly set
+        if (issueSeverity != null) {
+            if ("CRITICAL".equalsIgnoreCase(issueSeverity)) {
+                return "nova-premier";
+            } else {
+                return "nova-lite";
+            }
+        }
+        
+        return "nova-lite"; // Default fallback
     }
     
     // Getters and Setters
