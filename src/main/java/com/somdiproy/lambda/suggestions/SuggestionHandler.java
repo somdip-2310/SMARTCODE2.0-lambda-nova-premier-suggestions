@@ -680,13 +680,14 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 	        
 	        String sanitized = jsonContent;
 	        
-	        // Step 1: Fix double-escaped sequences (most critical)
 	        sanitized = sanitized
+	            .replaceAll("\\{\\s+\"", "{\"")  // Remove extra spaces after opening brace
+	            .replaceAll("\"\\s*:\\s*\\{\\s+\"", "\":{\"")  // Clean up object formatting
 	            .replace("\\\\n", "\\n")      // Fix double-escaped newlines
 	            .replace("\\\\t", "\\t")      // Fix double-escaped tabs  
 	            .replace("\\\\r", "\\r")      // Fix double-escaped carriage returns
 	            .replace("\\\\\"", "\\\"")    // Fix double-escaped quotes
-	            .replace("\\\\\\\\", "\\\\"); // Fix double-escaped backslashes
+	            .replace("\\\\\\\\", "\\\\"); // Fix double-escaped backslashes // Fix double-escaped backslashes
 	        
 	        // Step 2: Handle unescaped control characters in strings
 	        sanitized = sanitized
