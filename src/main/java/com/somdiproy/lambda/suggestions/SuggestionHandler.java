@@ -275,7 +275,7 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 	    double cost = 0.0;
 	    int successCount = 0;
 	    int failureCount = 0;
-	    long baseDelay = 2000L; // 5 second base delay between requests
+	    long baseDelay = 1000L; // 1 second base delay - 5x faster
 
 	    for (int i = 0; i < issues.size(); i++) {
 	        try {
@@ -307,10 +307,12 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 	                }
 	            }
 
-	            // Progressive delay - longer delays after failures
+	            // Progressive delay - but cap maximum delay for speed
 	            if (i < issues.size() - 1) {
 	                long adaptiveDelay = calculateSequentialDelay(baseDelay, failureCount, successCount);
-	                logger.log(String.format("⏸️ Waiting %dms before next request (adaptive delay)", adaptiveDelay));
+	                // Cap maximum delay at 3 seconds for speed
+	                adaptiveDelay = Math.min(adaptiveDelay, 3000L);
+	                logger.log(String.format("⏸️ Waiting %dms before next request (adaptive delay, capped)", adaptiveDelay));
 	                Thread.sleep(adaptiveDelay);
 	            }
 
@@ -330,18 +332,18 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 	 * Calculate adaptive delay based on success/failure rate
 	 */
 	private long calculateSequentialDelay(long baseDelay, int failures, int successes) {
-	    // More aggressive optimization for better performance
+	    // Much more aggressive delay reduction for speed
 	    if (failures == 0) {
-	        return Math.max(1000L, baseDelay / 2); // Reduce delay when successful
+	        return 500L; // Only 0.5 seconds when everything works
 	    }
 	    
 	    double failureRate = (double) failures / (failures + successes);
 	    if (failureRate > 0.5) {
-	        return baseDelay * 2; // Only double for high failure rates
+	        return baseDelay * 2; // 2 seconds for high failure rate
 	    } else if (failureRate > 0.25) {
-	        return (long) (baseDelay * 1.5); // Moderate increase
+	        return (long) (baseDelay * 1.5); // 1.5 seconds for medium failure rate
 	    } else {
-	        return baseDelay; // Standard delay for low failure rates
+	        return baseDelay; // 1 second for low failure rate
 	    }
 	}
 	
@@ -666,52 +668,160 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 	/**
 	 * Sanitize JSON string to handle character escaping issues
 	 */
+	/**
+	 * Enhanced JSON sanitization with proper escape sequence handling
+	 */
 	private String sanitizeJsonString(String jsonContent) {
 	    try {
 	        // Pre-validate JSON structure
 	        if (jsonContent == null || jsonContent.trim().isEmpty()) {
-	            return "{}";
+	            return createEnhancedFallbackJsonResponse("Empty content");
 	        }
 	        
-	        // Enhanced sanitization with proper escaping
-	        String sanitized = jsonContent
-	            // Fix control characters first
-	            .replace("\n", "\\n")
-	            .replace("\r", "\\r") 
-	            .replace("\t", "\\t")
-	            .replace("\b", "\\b")
-	            .replace("\f", "\\f")
-	            // Fix backslash escaping (most critical fix)
-	            .replace("\\\\", "\\\\\\\\")  // Double-escape backslashes
-	            .replace("\\\"", "\\\\\"")    // Fix escaped quotes
-	            .replace("\\n", "\\\\n")      // Fix escaped newlines
-	            .replace("\\t", "\\\\t")      // Fix escaped tabs
-	            .replace("\\r", "\\\\r")      // Fix escaped carriage returns
-	            // Clean up trailing commas
-	            .replaceAll(",\\s*([}\\]])", "$1")
-	            // Remove any remaining invalid characters
-	            .replaceAll("[\\x00-\\x1F\\x7F]", "");
+	        String sanitized = jsonContent;
 	        
-	        // Basic JSON structure validation
-	        if (!sanitized.trim().startsWith("{") || !sanitized.trim().endsWith("}")) {
-	            log.error("⚠️ Invalid JSON structure detected, attempting to wrap");
-	            sanitized = "{ \"content\": \"" + sanitized.replace("\"", "\\\"") + "\" }";
+	        // Step 1: Fix double-escaped sequences (most critical)
+	        sanitized = sanitized
+	            .replace("\\\\n", "\\n")      // Fix double-escaped newlines
+	            .replace("\\\\t", "\\t")      // Fix double-escaped tabs  
+	            .replace("\\\\r", "\\r")      // Fix double-escaped carriage returns
+	            .replace("\\\\\"", "\\\"")    // Fix double-escaped quotes
+	            .replace("\\\\\\\\", "\\\\"); // Fix double-escaped backslashes
+	        
+	        // Step 2: Handle unescaped control characters in strings
+	        sanitized = sanitized
+	            .replaceAll("\"([^\"]*?)\\n([^\"]*?)\"", "\"$1\\\\n$2\"")  // Escape unescaped newlines in strings
+	            .replaceAll("\"([^\"]*?)\\t([^\"]*?)\"", "\"$1\\\\t$2\"")  // Escape unescaped tabs in strings
+	            .replaceAll("\"([^\"]*?)\\r([^\"]*?)\"", "\"$1\\\\r$2\""); // Escape unescaped carriage returns in strings
+	        
+	        // Step 3: Remove actual control characters that shouldn't be in JSON
+	        sanitized = sanitized.replaceAll("[\\x00-\\x1F\\x7F]", "");
+	        
+	        // Step 4: Fix trailing commas
+	        sanitized = sanitized.replaceAll(",\\s*([}\\]])", "$1");
+	        
+	        // Step 5: Ensure proper JSON structure
+	        sanitized = sanitized.trim();
+	        if (!sanitized.startsWith("{") || !sanitized.endsWith("}")) {
+	            log.warn("⚠️ Invalid JSON structure, wrapping content");
+	            return createEnhancedFallbackJsonResponse(sanitized);
 	        }
 	        
-	        // Test parse to ensure validity
+	        // Step 6: Test parse to ensure validity
 	        try {
 	            objectMapper.readTree(sanitized);
+	            log.debug("✅ JSON sanitization successful");
 	            return sanitized;
 	        } catch (Exception parseTest) {
-	        	log.warn("⚠️ JSON validation failed, using enhanced sanitization: {}", parseTest.getMessage());
-	        	return createEnhancedFallbackJsonResponse(jsonContent);
+	            log.warn("⚠️ JSON validation failed after sanitization: {}", parseTest.getMessage());
+	            
+	            // Try one more aggressive fix for common issues
+	            String aggressiveFix = performAggressiveJsonFix(sanitized);
+	            try {
+	                objectMapper.readTree(aggressiveFix);
+	                log.info("✅ Aggressive JSON fix successful");
+	                return aggressiveFix;
+	            } catch (Exception e) {
+	                log.warn("❌ Aggressive fix also failed, using enhanced fallback");
+	                return createEnhancedFallbackJsonResponse(jsonContent);
+	            }
 	        }
 	        
 	    } catch (Exception e) {
-	    	Logger.loggerFor("");
-	        log.error("❌ JSON sanitization failed: " + e.getMessage());
-	        return createFallbackJsonResponse(jsonContent);
+	        log.error("❌ JSON sanitization failed: {}", e.getMessage());
+	        return createEnhancedFallbackJsonResponse(jsonContent);
 	    }
+	}
+
+	/**
+	 * Aggressive JSON fix for severely malformed JSON
+	 */
+	private String performAggressiveJsonFix(String jsonContent) {
+	    try {
+	        // Remove problematic escape sequences and rebuild clean JSON
+	        String content = jsonContent;
+	        
+	        // Extract key content using regex patterns
+	        String title = extractJsonValue(content, "title");
+	        String searchCode = extractJsonValue(content, "searchCode");
+	        String replaceCode = extractJsonValue(content, "replaceCode");
+	        String explanation = extractJsonValue(content, "explanation");
+	        
+	        // Build clean JSON manually
+	        StringBuilder cleanJson = new StringBuilder();
+	        cleanJson.append("{\n");
+	        cleanJson.append("  \"immediateFix\": {\n");
+	        cleanJson.append("    \"title\": \"").append(cleanString(title)).append("\",\n");
+	        cleanJson.append("    \"searchCode\": \"").append(cleanString(searchCode)).append("\",\n");
+	        cleanJson.append("    \"replaceCode\": \"").append(cleanString(replaceCode)).append("\",\n");
+	        cleanJson.append("    \"explanation\": \"").append(cleanString(explanation)).append("\"\n");
+	        cleanJson.append("  },\n");
+	        cleanJson.append("  \"bestPractice\": {\n");
+	        cleanJson.append("    \"title\": \"Apply Best Practices\",\n");
+	        cleanJson.append("    \"code\": \"// Implement according to security guidelines\",\n");
+	        cleanJson.append("    \"benefits\": [\"Improved security\", \"Better maintainability\"]\n");
+	        cleanJson.append("  },\n");
+	        cleanJson.append("  \"testing\": {\n");
+	        cleanJson.append("    \"testCase\": \"// Add comprehensive tests\",\n");
+	        cleanJson.append("    \"validationSteps\": [\"Review implementation\", \"Test thoroughly\"]\n");
+	        cleanJson.append("  },\n");
+	        cleanJson.append("  \"prevention\": {\n");
+	        cleanJson.append("    \"guidelines\": [\"Follow security best practices\"],\n");
+	        cleanJson.append("    \"tools\": [{\"name\": \"Security Scanner\", \"description\": \"Automated scanning\"}],\n");
+	        cleanJson.append("    \"codeReviewChecklist\": [\"Security review\", \"Best practices compliance\"]\n");
+	        cleanJson.append("  }\n");
+	        cleanJson.append("}");
+	        
+	        return cleanJson.toString();
+	        
+	    } catch (Exception e) {
+	        log.error("Aggressive fix failed: {}", e.getMessage());
+	        throw e;
+	    }
+	}
+
+	/**
+	 * Extract JSON value with fallback
+	 */
+	private String extractJsonValue(String content, String key) {
+	    try {
+	        // Try to find the value after the key
+	        String pattern = "\"" + key + "\"\\s*:\\s*\"([^\"]*?)\"";
+	        java.util.regex.Pattern p = java.util.regex.Pattern.compile(pattern, java.util.regex.Pattern.DOTALL);
+	        java.util.regex.Matcher m = p.matcher(content);
+	        
+	        if (m.find()) {
+	            return m.group(1);
+	        }
+	        
+	        // Fallback based on key type
+	        return switch (key) {
+	            case "title" -> "Security Fix Required";
+	            case "searchCode" -> "Review the identified code section";
+	            case "replaceCode" -> "Apply appropriate security measures";
+	            case "explanation" -> "This issue requires security review and implementation.";
+	            default -> "Manual review required";
+	        };
+	        
+	    } catch (Exception e) {
+	        return "Manual review required";
+	    }
+	}
+
+	/**
+	 * Clean string for JSON inclusion
+	 */
+	private String cleanString(String input) {
+	    if (input == null) return "";
+	    
+	    return input
+	        .replace("\\", "\\\\")    // Escape backslashes
+	        .replace("\"", "\\\"")    // Escape quotes
+	        .replace("\n", "\\n")     // Escape newlines
+	        .replace("\r", "\\r")     // Escape carriage returns
+	        .replace("\t", "\\t")     // Escape tabs
+	        .replaceAll("[\\x00-\\x1F\\x7F]", "") // Remove control characters
+	        .trim();
 	}
 
 	// Helper methods for parsing suggestion components
