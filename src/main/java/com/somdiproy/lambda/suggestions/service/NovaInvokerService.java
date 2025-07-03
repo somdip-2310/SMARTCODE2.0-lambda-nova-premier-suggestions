@@ -51,19 +51,22 @@ public class NovaInvokerService {
             	    )
             	);
             
-            requestBody.put("messages", messages);
-            // FIXED: Removed max_tokens and temperature from root level
-            
-            // Nova-specific inference configuration
-            // All model parameters must be inside inferenceConfig only
-            Map<String, Object> inferenceConfig = new HashMap<>();
-            inferenceConfig.put("max_tokens", maxTokens);
-            inferenceConfig.put("temperature", temperature);
-            // Note: top_p is not supported in Nova models
-            requestBody.put("inferenceConfig", inferenceConfig);
-            
-            String requestJson = objectMapper.writeValueAsString(requestBody);
-            log.debug("Nova API Request: {}", requestJson);
+				requestBody.put("messages", messages);
+				// FIXED: Removed max_tokens and temperature from root level
+
+				// Nova-specific inference configuration
+				// All model parameters must be inside inferenceConfig only
+				// Nova-specific inference configuration
+				// All model parameters must be inside inferenceConfig only
+				Map<String, Object> inferenceConfig = new HashMap<>();
+				inferenceConfig.put("maxTokens", maxTokens); // Changed from "max_tokens" to "maxTokens"
+				inferenceConfig.put("temperature", temperature);
+				// Note: top_p is not supported in Nova models
+				// Note: top_p is not supported in Nova models
+				requestBody.put("inferenceConfig", inferenceConfig);
+
+				String requestJson = objectMapper.writeValueAsString(requestBody);
+				log.debug("Nova API Request: {}", requestJson);
             
             // Create Bedrock request
             InvokeModelRequest request = InvokeModelRequest.builder()
