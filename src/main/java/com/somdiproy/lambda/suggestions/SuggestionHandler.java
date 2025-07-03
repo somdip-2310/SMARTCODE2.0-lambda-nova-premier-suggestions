@@ -10,6 +10,9 @@ import com.somdiproy.lambda.suggestions.model.DeveloperSuggestion;
 import com.somdiproy.lambda.suggestions.service.NovaInvokerService;
 import com.somdiproy.lambda.suggestions.service.DynamoDBService;
 import com.somdiproy.lambda.suggestions.util.TokenOptimizer;
+
+import software.amazon.awssdk.utils.Logger;
+
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.*;
@@ -663,19 +666,51 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 	 * Sanitize JSON string to handle character escaping issues
 	 */
 	private String sanitizeJsonString(String jsonContent) {
-		return jsonContent
-			// Fix unescaped single quotes in strings
-			.replaceAll("(?<!\\\\)'", "\\\\'")
-			// Fix unescaped double quotes in strings  
-			.replaceAll("(?<!\\\\)\"([^\"]*?)(?<!\\\\)\"([^,}\\]]*?)(?<!\\\\)\"", "\\\"$1\\\"$2\\\"")
-			// Fix newlines in strings
-			.replaceAll("\\n", "\\\\n")
-			.replaceAll("\\r", "\\\\r")
-			// Fix tabs in strings
-			.replaceAll("\\t", "\\\\t")
-			// Remove any trailing commas
-			.replaceAll(",\\s*}", "}")
-			.replaceAll(",\\s*]", "]");
+	    try {
+	        // Pre-validate JSON structure
+	        if (jsonContent == null || jsonContent.trim().isEmpty()) {
+	            return "{}";
+	        }
+	        
+	        // Enhanced sanitization with proper escaping
+	        String sanitized = jsonContent
+	            // Fix control characters first
+	            .replace("\n", "\\n")
+	            .replace("\r", "\\r") 
+	            .replace("\t", "\\t")
+	            .replace("\b", "\\b")
+	            .replace("\f", "\\f")
+	            // Fix backslash escaping (most critical fix)
+	            .replace("\\\\", "\\\\\\\\")  // Double-escape backslashes
+	            .replace("\\\"", "\\\\\"")    // Fix escaped quotes
+	            .replace("\\n", "\\\\n")      // Fix escaped newlines
+	            .replace("\\t", "\\\\t")      // Fix escaped tabs
+	            .replace("\\r", "\\\\r")      // Fix escaped carriage returns
+	            // Clean up trailing commas
+	            .replaceAll(",\\s*([}\\]])", "$1")
+	            // Remove any remaining invalid characters
+	            .replaceAll("[\\x00-\\x1F\\x7F]", "");
+	        
+	        // Basic JSON structure validation
+	        if (!sanitized.trim().startsWith("{") || !sanitized.trim().endsWith("}")) {
+	            log.error("⚠️ Invalid JSON structure detected, attempting to wrap");
+	            sanitized = "{ \"content\": \"" + sanitized.replace("\"", "\\\"") + "\" }";
+	        }
+	        
+	        // Test parse to ensure validity
+	        try {
+	            objectMapper.readTree(sanitized);
+	            return sanitized;
+	        } catch (Exception parseTest) {
+	            log.error("⚠️ JSON validation failed, using fallback sanitization");
+	            return createFallbackJsonResponse(jsonContent);
+	        }
+	        
+	    } catch (Exception e) {
+	    	Logger.loggerFor("");
+	        log.error("❌ JSON sanitization failed: " + e.getMessage());
+	        return createFallbackJsonResponse(jsonContent);
+	    }
 	}
 
 	// Helper methods for parsing suggestion components
@@ -864,5 +899,35 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 				Thread.currentThread().interrupt();
 			}
 		}
+	}
+	
+	/**
+	 * Create a fallback JSON response when sanitization fails
+	 */
+	private String createFallbackJsonResponse(String originalContent) {
+	    return String.format("""
+	        {
+	          "immediateFix": {
+	            "title": "Code Review Required",
+	            "searchCode": "Review the identified code section",
+	            "replaceCode": "Apply appropriate security measures and best practices",
+	            "explanation": "This issue requires manual review and implementation of security best practices."
+	          },
+	          "bestPractice": {
+	            "title": "Follow Security Guidelines",
+	            "code": "// Implement according to security best practices",
+	            "benefits": ["Improved security", "Better maintainability", "Reduced vulnerabilities"]
+	          },
+	          "testing": {
+	            "testCase": "// Add comprehensive unit tests",
+	            "validationSteps": ["Review code changes", "Test functionality", "Verify security measures"]
+	          },
+	          "prevention": {
+	            "guidelines": ["Follow security guidelines", "Regular code reviews", "Use static analysis tools"],
+	            "tools": [{"name": "Security Scanner", "description": "Automated security scanning"}],
+	            "codeReviewChecklist": ["Security implications", "Best practices compliance", "Test coverage"]
+	          }
+	        }
+	        """);
 	}
 }
