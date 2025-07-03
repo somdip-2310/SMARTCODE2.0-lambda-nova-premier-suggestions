@@ -77,38 +77,57 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 		}
 		
 		// Check if template mode is enabled globally
-		if (TEMPLATE_MODE_ENABLED && Math.random() < 0.09) {
-			return "TEMPLATE_MODE";
+		// Check if template mode is enabled globally
+		if (TEMPLATE_MODE_ENABLED) {
+		    // Use deterministic selection based on session from request
+		    String sessionId = request != null ? request.getSessionId() : "default";
+		    int sessionHash = Math.abs((sessionId != null ? sessionId : "default").hashCode()) % 100;
+		    if (sessionHash < 9) {
+		        return "TEMPLATE_MODE";
+		    }
 		}
-		
+
 		// Default to Nova Lite for most cases (90%)
-		return Math.random() < 0.90 ? NOVA_LITE_MODEL_ID : DEFAULT_MODEL_ID;
+		String sessionId = request != null ? request.getSessionId() : "default";
+		int sessionHash = Math.abs((sessionId != null ? sessionId : "default").hashCode()) % 100;
+		return sessionHash < 90 ? NOVA_LITE_MODEL_ID : DEFAULT_MODEL_ID;
 	}
 
 	/**
 	 * Determine which model to use for a specific issue based on hybrid strategy
+	 * Uses deterministic selection based on issue characteristics for consistency
 	 */
 	private String determineModelForIssue(Map<String, Object> issue) {
-		String severity = (String) issue.getOrDefault("severity", "MEDIUM");
-		String category = (String) issue.getOrDefault("category", "quality");
-		
-		// 1% Nova Premier for CRITICAL security issues only
-		if ("CRITICAL".equalsIgnoreCase(severity) && "security".equalsIgnoreCase(category)) {
-			return Math.random() < 0.01 ? DEFAULT_MODEL_ID : NOVA_LITE_MODEL_ID;
-		}
-		
-		// 90% Nova Lite for most issues
-		if (Math.random() < 0.90) {
-			return NOVA_LITE_MODEL_ID;
-		}
-		
-		// 9% Enhanced Templates for fallback
-		if (Math.random() < 0.99) { // 9% of remaining 10%
-			return "TEMPLATE_MODE";
-		}
-		
-		// Fallback to Nova Lite (remaining 1%)
-		return NOVA_LITE_MODEL_ID;
+	    String severity = (String) issue.getOrDefault("severity", "MEDIUM");
+	    String category = (String) issue.getOrDefault("category", "quality");
+	    
+	    // Create deterministic hash from issue characteristics
+	    String issueKey = String.format("%s_%s_%s_%s", 
+	        issue.getOrDefault("id", "unknown"),
+	        issue.getOrDefault("type", "unknown"),
+	        issue.getOrDefault("file", "unknown"),
+	        issue.getOrDefault("line", "0")
+	    );
+	    
+	    int hash = Math.abs(issueKey.hashCode()) % 100;
+	    
+	    // 1% Nova Premier for CRITICAL security issues only
+	    if ("CRITICAL".equalsIgnoreCase(severity) && "security".equalsIgnoreCase(category)) {
+	        return hash < 1 ? DEFAULT_MODEL_ID : NOVA_LITE_MODEL_ID;
+	    }
+	    
+	    // 90% Nova Lite for most issues
+	    if (hash < 90) {
+	        return NOVA_LITE_MODEL_ID;
+	    }
+	    
+	    // 9% Enhanced Templates for fallback (90-98)
+	    if (hash < 99) {
+	        return "TEMPLATE_MODE";
+	    }
+	    
+	    // Skip remaining 1% (99)
+	    return NOVA_LITE_MODEL_ID; // Changed to Nova Lite instead of skipping
 	}
 
 	private void initializeExecutorService() {
