@@ -42,9 +42,14 @@ public class NovaInvokerService {
             Map<String, Object> requestBody = new HashMap<>();
             
             // Nova-specific message format
-            List<Map<String, String>> messages = List.of(
-                Map.of("role", "user", "content", prompt)
-            );
+            List<Map<String, Object>> messages = List.of(
+            	    Map.of(
+            	        "role", "user",
+            	        "content", List.of(
+            	            Map.of("text", prompt)
+            	        )
+            	    )
+            	);
             
             requestBody.put("messages", messages);
             // FIXED: Removed max_tokens and temperature from root level
