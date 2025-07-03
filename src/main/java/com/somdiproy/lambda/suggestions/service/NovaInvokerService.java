@@ -37,7 +37,7 @@ public class NovaInvokerService {
     private static final double JITTER_FACTOR = 0.25; // 25% jitter
     
     // Rate limiting configuration for Nova Premier
-    private static final long MIN_CALL_INTERVAL_MS = 2000; // Reduce to 0.5 calls per second for Nova Premier
+    private static final long MIN_CALL_INTERVAL_MS = 5000; // Reduce to 0.5 calls per second for Nova Premier
     private static final long ADAPTIVE_BACKOFF_MULTIPLIER = 2;
     private volatile long currentBackoffMs = MIN_CALL_INTERVAL_MS; 
     private static final int RATE_LIMIT_WINDOW_SIZE = 10; // Track last 10 calls

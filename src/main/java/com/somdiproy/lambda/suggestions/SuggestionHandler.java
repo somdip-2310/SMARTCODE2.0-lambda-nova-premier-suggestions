@@ -34,7 +34,7 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 	private static final int MAX_TOKENS = Integer.parseInt(System.getenv("MAX_TOKENS")); // 8000
 
 	// Batch processing configuration
-	private static final int BATCH_SIZE = Integer.parseInt(System.getenv().getOrDefault("BATCH_SIZE", "2"));
+	private static final int BATCH_SIZE = Integer.parseInt(System.getenv().getOrDefault("BATCH_SIZE", "1")); // Single issue per batch for Nova stability
 	private static final int MAX_ISSUES_PER_ANALYSIS = 25; // Limit total issues to prevent timeout
 	private static final long BATCH_DELAY_MS = Long.parseLong(System.getenv().getOrDefault("BATCH_DELAY_MS", "2000"));
 	private static final int MAX_CONCURRENT_CALLS = Integer
@@ -118,14 +118,15 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 						batch.size()));
 
 				// Add delay between batches to prevent throttling (except for first batch)
-				if (batchIndex > 0) {
-					long delay = calculateBatchDelay(batchIndex);
-					logger.log(String.format("⏸️ Waiting %dms before processing next batch", delay));
-					Thread.sleep(delay);
+				// Enhanced delay strategy: always wait between batches for Nova API stability
+				long delay = calculateAdaptiveBatchDelay(batchIndex, totalTokensUsed);
+				if (batchIndex > 0 || totalTokensUsed > 0) { // Always delay after first request
+				    logger.log(String.format("⏸️ Waiting %dms before processing next batch (adaptive Nova delay)", delay));
+				    Thread.sleep(delay);
 				}
 
-				// Process batch with parallel execution within limits
-				BatchResult batchResult = processBatch(batch, context, logger);
+				// Switch to sequential processing for Nova API stability
+				BatchResult batchResult = processIssuesSequentially(batch, context, logger);
 
 				// Aggregate results
 				allSuggestions.addAll(batchResult.suggestions);
@@ -187,7 +188,86 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 					"Failed to generate suggestions: " + e.getMessage());
 		}
 	}
+	
+	/**
+	 * Process issues sequentially with proper delays for Nova API
+	 */
+	private BatchResult processIssuesSequentially(List<Map<String, Object>> issues, Context context, LambdaLogger logger)
+	        throws InterruptedException {
+	    List<DeveloperSuggestion> suggestions = new ArrayList<>();
+	    int tokensUsed = 0;
+	    double cost = 0.0;
+	    int successCount = 0;
+	    int failureCount = 0;
+	    long baseDelay = 5000L; // 5 second base delay between requests
 
+	    for (int i = 0; i < issues.size(); i++) {
+	        try {
+	            Map<String, Object> issue = issues.get(i);
+	            logger.log(String.format("🔍 Processing issue %d/%d: %s", 
+	                i + 1, issues.size(), issue.get("id")));
+
+	            // Check remaining time
+	            if (context.getRemainingTimeInMillis() < TIMEOUT_BUFFER_MS + baseDelay) {
+	                logger.log("⏰ Insufficient time remaining, stopping processing");
+	                break;
+	            }
+
+	            // Generate suggestion with enhanced error handling
+	            DeveloperSuggestion suggestion = generateSuggestionForIssue(issue, logger);
+	            
+	            if (suggestion != null) {
+	                suggestions.add(suggestion);
+	                tokensUsed += suggestion.getTokensUsed();
+	                cost += suggestion.getCost();
+	                
+	                // Check if this is a real suggestion or fallback
+	                if (suggestion.getModelUsed().contains("fallback")) {
+	                    failureCount++;
+	                    logger.log("⚠️ Fallback suggestion created for issue: " + issue.get("id"));
+	                } else {
+	                    successCount++;
+	                    logger.log("✅ Successful suggestion generated for issue: " + issue.get("id"));
+	                }
+	            }
+
+	            // Progressive delay - longer delays after failures
+	            if (i < issues.size() - 1) {
+	                long adaptiveDelay = calculateSequentialDelay(baseDelay, failureCount, successCount);
+	                logger.log(String.format("⏸️ Waiting %dms before next request (adaptive delay)", adaptiveDelay));
+	                Thread.sleep(adaptiveDelay);
+	            }
+
+	        } catch (Exception e) {
+	            logger.log("❌ Error processing issue " + i + ": " + e.getMessage());
+	            failureCount++;
+	        }
+	    }
+
+	    logger.log(String.format("📊 Sequential processing complete: %d success, %d failures, %d total tokens, $%.4f cost",
+	        successCount, failureCount, tokensUsed, cost));
+
+	    return new BatchResult(suggestions, tokensUsed, cost);
+	}
+
+	/**
+	 * Calculate adaptive delay based on success/failure rate
+	 */
+	private long calculateSequentialDelay(long baseDelay, int failures, int successes) {
+	    if (failures == 0) {
+	        return baseDelay; // Standard delay when everything works
+	    }
+	    
+	    double failureRate = (double) failures / (failures + successes);
+	    if (failureRate > 0.5) {
+	        return baseDelay * 3; // Triple delay if >50% failure rate
+	    } else if (failureRate > 0.25) {
+	        return baseDelay * 2; // Double delay if >25% failure rate  
+	    } else {
+	        return (long) (baseDelay * 1.5); // 50% increase for any failures
+	    }
+	}
+	
 	/**
 	 * Create batches from issues list
 	 */
@@ -210,7 +290,24 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 		long progressiveDelay = baseDelay + (batchIndex * 500L); // Add 500ms per batch
 		return Math.min(progressiveDelay, 10000L); // Cap at 10 seconds
 	}
-
+	/**
+	 * Calculate adaptive batch delay based on current load and Nova API performance
+	 */
+	private long calculateAdaptiveBatchDelay(int batchIndex, int tokensUsed) {
+	    // Base delay for Nova Premier stability
+	    long baseDelay = BATCH_DELAY_MS;
+	    
+	    // Increase delay based on batch number (cumulative throttling protection)
+	    long scalingDelay = baseDelay * Math.min(batchIndex, 5); // Cap scaling at 5x
+	    
+	    // Additional delay based on token usage (API load indicator)
+	    long tokenBasedDelay = (tokensUsed / 1000) * 500L; // 500ms per 1K tokens
+	    
+	    // Progressive delay: starts high, stays high for Nova
+	    long progressiveDelay = Math.max(scalingDelay + tokenBasedDelay, 5000L); // Minimum 5s
+	    
+	    return Math.min(progressiveDelay, 30000L); // Cap at 30s
+	}
 	/**
 	 * Check if we should slow down based on statistics
 	 */
@@ -382,7 +479,8 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 		int jsonEnd = response.lastIndexOf("```");
 
 		if (jsonStart != -1 && jsonEnd != -1 && jsonStart < jsonEnd) {
-			return response.substring(jsonStart + 7, jsonEnd).trim();
+			String jsonContent = response.substring(jsonStart + 7, jsonEnd).trim();
+			return sanitizeJsonString(jsonContent);
 		}
 
 		// Fallback: try to find JSON without code blocks
@@ -390,10 +488,30 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 		jsonEnd = response.lastIndexOf("}") + 1;
 
 		if (jsonStart != -1 && jsonEnd > jsonStart) {
-			return response.substring(jsonStart, jsonEnd);
+			String jsonContent = response.substring(jsonStart, jsonEnd);
+			return sanitizeJsonString(jsonContent);
 		}
 
 		throw new IllegalArgumentException("No valid JSON found in response");
+	}
+
+	/**
+	 * Sanitize JSON string to handle character escaping issues
+	 */
+	private String sanitizeJsonString(String jsonContent) {
+		return jsonContent
+			// Fix unescaped single quotes in strings
+			.replaceAll("(?<!\\\\)'", "\\\\'")
+			// Fix unescaped double quotes in strings  
+			.replaceAll("(?<!\\\\)\"([^\"]*?)(?<!\\\\)\"([^,}\\]]*?)(?<!\\\\)\"", "\\\"$1\\\"$2\\\"")
+			// Fix newlines in strings
+			.replaceAll("\\n", "\\\\n")
+			.replaceAll("\\r", "\\\\r")
+			// Fix tabs in strings
+			.replaceAll("\\t", "\\\\t")
+			// Remove any trailing commas
+			.replaceAll(",\\s*}", "}")
+			.replaceAll(",\\s*]", "]");
 	}
 
 	// Helper methods for parsing suggestion components
