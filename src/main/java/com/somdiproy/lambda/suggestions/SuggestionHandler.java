@@ -11,7 +11,7 @@ import com.somdiproy.lambda.suggestions.service.NovaInvokerService;
 import com.somdiproy.lambda.suggestions.service.DynamoDBService;
 import com.somdiproy.lambda.suggestions.util.TokenOptimizer;
 import com.fasterxml.jackson.databind.ObjectMapper;
-
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.stream.Collectors;
@@ -33,7 +33,8 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
     private static final int MAX_TOKENS = Integer.parseInt(System.getenv("MAX_TOKENS")); // 8000
     
     // Batch processing configuration
-    private static final int BATCH_SIZE = Integer.parseInt(System.getenv().getOrDefault("BATCH_SIZE", "5"));
+    private static final int BATCH_SIZE = Integer.parseInt(System.getenv().getOrDefault("BATCH_SIZE", "2"));
+    private static final int MAX_ISSUES_PER_ANALYSIS = 25; // Limit total issues to prevent timeout
     private static final long BATCH_DELAY_MS = Long.parseLong(System.getenv().getOrDefault("BATCH_DELAY_MS", "2000"));
     private static final int MAX_CONCURRENT_CALLS = Integer.parseInt(System.getenv().getOrDefault("MAX_CONCURRENT_CALLS", "2"));
     
@@ -227,7 +228,9 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
     private boolean shouldSlowDown(Map<String, Object> stats) {
         Map<String, Integer> throttleCounts = (Map<String, Integer>) stats.get("throttleCounts");
         if (throttleCounts != null && !throttleCounts.isEmpty()) {
-            int totalThrottles = throttleCounts.values().stream().mapToInt(Integer::intValue).sum();
+            int totalThrottles = throttleCounts.values().stream()
+                .mapToInt(Integer::intValue)
+                .sum();
             return totalThrottles > 2; // Slow down if we've seen more than 2 throttles
         }
         
