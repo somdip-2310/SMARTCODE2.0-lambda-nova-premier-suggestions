@@ -49,13 +49,13 @@ public class NovaInvokerService {
             requestBody.put("messages", messages);
             requestBody.put("max_tokens", maxTokens);
             requestBody.put("temperature", temperature);
-            requestBody.put("top_p", topP);
+            //requestBody.put("top_p", topP); // Not supported in Nova
             
             // Additional Nova-specific parameters
             Map<String, Object> inferenceConfig = new HashMap<>();
             inferenceConfig.put("max_tokens", maxTokens);
             inferenceConfig.put("temperature", temperature);
-            inferenceConfig.put("top_p", topP);
+            //inferenceConfig.put("top_p", topP); // Not supported in Nova
             requestBody.put("inferenceConfig", inferenceConfig);
             
             String requestJson = objectMapper.writeValueAsString(requestBody);
