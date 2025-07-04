@@ -24,6 +24,9 @@ public class DeveloperSuggestion {
     @JsonProperty("language")
     private String language;
     
+    @JsonProperty("issueDescription")
+    private String issueDescription;
+    
     @JsonProperty("immediateFix")
     private ImmediateFix immediateFix;
     
@@ -57,6 +60,7 @@ public class DeveloperSuggestion {
         this.issueCategory = builder.issueCategory;
         this.issueSeverity = builder.issueSeverity;
         this.language = builder.language;
+        this.issueDescription = builder.issueDescription;
         this.immediateFix = builder.immediateFix;
         this.bestPractice = builder.bestPractice;
         this.testing = builder.testing;
@@ -77,6 +81,7 @@ public class DeveloperSuggestion {
         private String issueCategory;
         private String issueSeverity;
         private String language;
+        private String issueDescription;
         private ImmediateFix immediateFix;
         private BestPractice bestPractice;
         private Testing testing;
@@ -91,6 +96,7 @@ public class DeveloperSuggestion {
         public Builder issueCategory(String issueCategory) { this.issueCategory = issueCategory; return this; }
         public Builder issueSeverity(String issueSeverity) { this.issueSeverity = issueSeverity; return this; }
         public Builder language(String language) { this.language = language; return this; }
+        public Builder issueDescription(String issueDescription) { this.issueDescription = issueDescription; return this; }
         public Builder immediateFix(ImmediateFix immediateFix) { this.immediateFix = immediateFix; return this; }
         public Builder bestPractice(BestPractice bestPractice) { this.bestPractice = bestPractice; return this; }
         public Builder testing(Testing testing) { this.testing = testing; return this; }
@@ -310,6 +316,7 @@ public class DeveloperSuggestion {
     public String getIssueCategory() { return issueCategory; }
     public String getIssueSeverity() { return issueSeverity; }
     public String getLanguage() { return language; }
+    public String getIssueDescription() { return issueDescription; }
     public ImmediateFix getImmediateFix() { return immediateFix; }
     public BestPractice getBestPractice() { return bestPractice; }
     public Testing getTesting() { return testing; }

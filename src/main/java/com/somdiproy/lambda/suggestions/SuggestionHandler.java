@@ -481,13 +481,13 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 	 */
 	private String buildCategoryOptimizedPrompt(Map<String, Object> issue, String category) {
 	    StringBuilder prompt = new StringBuilder();
-
+	    
 	    String language = (String) issue.get("language");
 	    String type = (String) issue.get("type");
 	    String severity = (String) issue.get("severity");
 	    String codeSnippet = (String) issue.get("codeSnippet");
 	    String description = (String) issue.get("description");
-
+	    
 	    // Category-specific prompt optimization
 	    switch (category.toLowerCase()) {
 	        case "security":
@@ -514,21 +514,25 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 	        default:
 	            return buildSuggestionPrompt(issue); // Fallback to existing method
 	    }
-
+	    
 	    prompt.append("Code:\n```").append(language != null ? language.toLowerCase() : "text").append("\n");
 	    prompt.append(TokenOptimizer.truncateCode(codeSnippet, 500)).append("\n");
 	    prompt.append("```\n\n");
-
-	    // Category-specific JSON structure request
+	    
+	    // Category-specific JSON structure request with issueDescription
 	    if ("security".equals(category.toLowerCase())) {
-	        prompt.append("Generate SECURITY-FOCUSED fix as JSON with emphasis on vulnerability mitigation:\n");
+	        prompt.append("Generate SECURITY-FOCUSED fix as JSON with emphasis on vulnerability mitigation.\n");
+	        prompt.append("IMPORTANT: Start with a detailed 'issueDescription' that explains what this vulnerability is and how it can be exploited (2-3 sentences):\n");
 	    } else if ("performance".equals(category.toLowerCase())) {
-	        prompt.append("Generate PERFORMANCE-FOCUSED optimization as JSON with metrics and benchmarks:\n");
+	        prompt.append("Generate PERFORMANCE-FOCUSED optimization as JSON with metrics and benchmarks.\n");
+	        prompt.append("IMPORTANT: Start with a detailed 'issueDescription' that explains what this performance issue is and how it impacts the application (2-3 sentences):\n");
 	    } else {
-	        prompt.append("Generate QUALITY-FOCUSED improvement as JSON with maintainability focus:\n");
+	        prompt.append("Generate QUALITY-FOCUSED improvement as JSON with maintainability focus.\n");
+	        prompt.append("IMPORTANT: Start with a detailed 'issueDescription' that explains what this code quality issue is and why it matters (2-3 sentences):\n");
 	    }
-
+	    
 	    prompt.append("```json\n{\n");
+	    prompt.append("  \"issueDescription\": \"Detailed explanation of what this ").append(type).append(" issue is, how it can be exploited/cause problems, and its potential impact (2-3 sentences)\",\n");
 	    prompt.append("  \"immediateFix\": {\n");
 	    prompt.append("    \"title\": \"Brief description\",\n");
 	    prompt.append("    \"searchCode\": \"Exact problematic code\",\n");
@@ -550,7 +554,7 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 	    prompt.append("    \"codeReviewChecklist\": [\"Check 1\", \"Check 2\"]\n");
 	    prompt.append("  }\n");
 	    prompt.append("}\n```");
-
+	    
 	    return prompt.toString();
 	}
 
@@ -1220,7 +1224,9 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 			return DeveloperSuggestion.builder().issueId(issueId).issueType((String) originalIssue.get("type"))
 					.issueCategory((String) originalIssue.get("category"))
 					.issueSeverity((String) originalIssue.get("severity"))
-					.language((String) originalIssue.get("language")).immediateFix(parseImmediateFix(suggestionData))
+					.language((String) originalIssue.get("language"))
+					.issueDescription((String) suggestionData.getOrDefault("issueDescription", generateDefaultIssueDescription(originalIssue)))
+					.immediateFix(parseImmediateFix(suggestionData))
 					.bestPractice(parseBestPractice(suggestionData)).testing(parseTesting(suggestionData))
 					.prevention(parsePrevention(suggestionData)).tokensUsed(tokensUsed).cost(cost)
 					.timestamp(System.currentTimeMillis()).modelUsed(modelUsed).build();
@@ -1336,28 +1342,33 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 	        String replaceCode = extractJsonValue(content, "replaceCode");
 	        String explanation = extractJsonValue(content, "explanation");
 	        
-	        // Build clean JSON manually
+	        // Try to extract issue context from the content
+	        String issueType = extractContextualInfo(content, "type");
+	        String category = extractContextualInfo(content, "category");
+	        String severity = extractContextualInfo(content, "severity");
+	        
+	        // Build clean JSON manually with category-aware responses
 	        StringBuilder cleanJson = new StringBuilder();
 	        cleanJson.append("{\n");
 	        cleanJson.append("  \"immediateFix\": {\n");
-	        cleanJson.append("    \"title\": \"").append(cleanString(title)).append("\",\n");
-	        cleanJson.append("    \"searchCode\": \"").append(cleanString(searchCode)).append("\",\n");
-	        cleanJson.append("    \"replaceCode\": \"").append(cleanString(replaceCode)).append("\",\n");
-	        cleanJson.append("    \"explanation\": \"").append(cleanString(explanation)).append("\"\n");
+	        cleanJson.append("    \"title\": \"").append(cleanString(title.isEmpty() ? generateContextualTitle(issueType, category, severity) : title)).append("\",\n");
+	        cleanJson.append("    \"searchCode\": \"").append(cleanString(searchCode.isEmpty() ? "Review the identified code section" : searchCode)).append("\",\n");
+	        cleanJson.append("    \"replaceCode\": \"").append(cleanString(replaceCode.isEmpty() ? generateContextualFix(issueType, category) : replaceCode)).append("\",\n");
+	        cleanJson.append("    \"explanation\": \"").append(cleanString(explanation.isEmpty() ? generateContextualExplanation(issueType, category, severity) : explanation)).append("\"\n");
 	        cleanJson.append("  },\n");
 	        cleanJson.append("  \"bestPractice\": {\n");
-	        cleanJson.append("    \"title\": \"Apply Best Practices\",\n");
-	        cleanJson.append("    \"code\": \"// Implement according to security guidelines\",\n");
-	        cleanJson.append("    \"benefits\": [\"Improved security\", \"Better maintainability\"]\n");
+	        cleanJson.append("    \"title\": \"").append(generateBestPracticeTitle(category)).append("\",\n");
+	        cleanJson.append("    \"code\": \"").append(generateBestPracticeCode(issueType, category)).append("\",\n");
+	        cleanJson.append("    \"benefits\": ").append(generateBenefits(category)).append("\n");
 	        cleanJson.append("  },\n");
 	        cleanJson.append("  \"testing\": {\n");
-	        cleanJson.append("    \"testCase\": \"// Add comprehensive tests\",\n");
-	        cleanJson.append("    \"validationSteps\": [\"Review implementation\", \"Test thoroughly\"]\n");
+	        cleanJson.append("    \"testCase\": \"").append(generateTestCase(issueType, category)).append("\",\n");
+	        cleanJson.append("    \"validationSteps\": ").append(generateValidationSteps(category)).append("\n");
 	        cleanJson.append("  },\n");
 	        cleanJson.append("  \"prevention\": {\n");
-	        cleanJson.append("    \"guidelines\": [\"Follow security best practices\"],\n");
-	        cleanJson.append("    \"tools\": [{\"name\": \"Security Scanner\", \"description\": \"Automated scanning\"}],\n");
-	        cleanJson.append("    \"codeReviewChecklist\": [\"Security review\", \"Best practices compliance\"]\n");
+	        cleanJson.append("    \"guidelines\": ").append(generateGuidelines(category)).append(",\n");
+	        cleanJson.append("    \"tools\": ").append(generateTools(category)).append(",\n");
+	        cleanJson.append("    \"codeReviewChecklist\": ").append(generateChecklist(category)).append("\n");
 	        cleanJson.append("  }\n");
 	        cleanJson.append("}");
 	        
@@ -1367,6 +1378,116 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 	        log.error("Aggressive fix failed: {}", e.getMessage());
 	        throw e;
 	    }
+	}
+	
+	private String extractContextualInfo(String content, String key) {
+	    try {
+	        String pattern = "\"" + key + "\"\\s*:\\s*\"([^\"]*?)\"";
+	        java.util.regex.Pattern p = java.util.regex.Pattern.compile(pattern);
+	        java.util.regex.Matcher m = p.matcher(content);
+	        return m.find() ? m.group(1) : "";
+	    } catch (Exception e) {
+	        return "";
+	    }
+	}
+	
+	private String generateContextualTitle(String issueType, String category, String severity) {
+	    if ("security".equalsIgnoreCase(category)) {
+	        return severity.equalsIgnoreCase("critical") ? "Critical Security Vulnerability" : "Security Enhancement Required";
+	    } else if ("performance".equalsIgnoreCase(category)) {
+	        return "Performance Optimization for " + (issueType.isEmpty() ? "Code" : issueType);
+	    }
+	    return "Code Quality Improvement Required";
+	}
+	
+	private String generateContextualFix(String issueType, String category) {
+	    if ("security".equalsIgnoreCase(category)) {
+	        return "Apply appropriate security controls and input validation";
+	    } else if ("performance".equalsIgnoreCase(category)) {
+	        return "Optimize the code for better performance and resource utilization";
+	    }
+	    return "Refactor code following best practices and coding standards";
+	}
+	
+	private String generateContextualExplanation(String issueType, String category, String severity) {
+	    if ("security".equalsIgnoreCase(category)) {
+	        return "This " + severity + " security issue requires immediate attention to prevent potential vulnerabilities.";
+	    } else if ("performance".equalsIgnoreCase(category)) {
+	        return "This performance issue can impact application responsiveness and should be optimized.";
+	    }
+	    return "This code quality issue should be addressed to improve maintainability and reliability.";
+	}
+	
+	private String generateBestPracticeTitle(String category) {
+	    if ("security".equalsIgnoreCase(category)) {
+	        return "Follow OWASP Security Guidelines";
+	    } else if ("performance".equalsIgnoreCase(category)) {
+	        return "Apply Performance Best Practices";
+	    }
+	    return "Follow Clean Code Principles";
+	}
+	
+	private String generateBestPracticeCode(String issueType, String category) {
+	    if ("security".equalsIgnoreCase(category)) {
+	        return "// Validate all inputs\\n// Use parameterized queries\\n// Implement proper authentication";
+	    } else if ("performance".equalsIgnoreCase(category)) {
+	        return "// Use efficient algorithms\\n// Implement caching where appropriate\\n// Optimize database queries";
+	    }
+	    return "// Follow SOLID principles\\n// Write self-documenting code\\n// Maintain consistent style";
+	}
+	
+	private String generateBenefits(String category) {
+	    if ("security".equalsIgnoreCase(category)) {
+	        return "[\"Enhanced security posture\", \"Compliance with standards\", \"Reduced vulnerability risk\"]";
+	    } else if ("performance".equalsIgnoreCase(category)) {
+	        return "[\"Improved response times\", \"Better resource utilization\", \"Enhanced scalability\"]";
+	    }
+	    return "[\"Better maintainability\", \"Improved code quality\", \"Reduced technical debt\"]";
+	}
+	
+	private String generateTestCase(String issueType, String category) {
+	    if ("security".equalsIgnoreCase(category)) {
+	        return "// Test with malicious inputs\\n// Verify security controls\\n// Check access restrictions";
+	    } else if ("performance".equalsIgnoreCase(category)) {
+	        return "// Benchmark performance\\n// Test with load\\n// Monitor resource usage";
+	    }
+	    return "// Unit test coverage\\n// Integration tests\\n// Edge case validation";
+	}
+	
+	private String generateValidationSteps(String category) {
+	    if ("security".equalsIgnoreCase(category)) {
+	        return "[\"Security code review\", \"Penetration testing\", \"Vulnerability scanning\"]";
+	    } else if ("performance".equalsIgnoreCase(category)) {
+	        return "[\"Performance profiling\", \"Load testing\", \"Resource monitoring\"]";
+	    }
+	    return "[\"Code review\", \"Unit testing\", \"Integration testing\"]";
+	}
+	
+	private String generateGuidelines(String category) {
+	    if ("security".equalsIgnoreCase(category)) {
+	        return "[\"Follow secure coding practices\", \"Regular security training\", \"Use security tools\"]";
+	    } else if ("performance".equalsIgnoreCase(category)) {
+	        return "[\"Profile before optimizing\", \"Focus on bottlenecks\", \"Monitor performance metrics\"]";
+	    }
+	    return "[\"Follow coding standards\", \"Write clean code\", \"Regular refactoring\"]";
+	}
+	
+	private String generateTools(String category) {
+	    if ("security".equalsIgnoreCase(category)) {
+	        return "[{\"name\": \"OWASP ZAP\", \"description\": \"Security vulnerability scanner\"}, {\"name\": \"SonarQube\", \"description\": \"Code security analysis\"}]";
+	    } else if ("performance".equalsIgnoreCase(category)) {
+	        return "[{\"name\": \"JProfiler\", \"description\": \"Performance profiling\"}, {\"name\": \"Apache JMeter\", \"description\": \"Load testing\"}]";
+	    }
+	    return "[{\"name\": \"SonarQube\", \"description\": \"Code quality analysis\"}, {\"name\": \"CheckStyle\", \"description\": \"Code style checker\"}]";
+	}
+	
+	private String generateChecklist(String category) {
+	    if ("security".equalsIgnoreCase(category)) {
+	        return "[\"Input validation\", \"Authentication checks\", \"Authorization verification\"]";
+	    } else if ("performance".equalsIgnoreCase(category)) {
+	        return "[\"Algorithm efficiency\", \"Resource usage\", \"Caching opportunities\"]";
+	    }
+	    return "[\"Code clarity\", \"Documentation\", \"Test coverage\"]";
 	}
 
 	/**
@@ -1545,7 +1666,43 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 		default -> "secure coding practices according to industry standards";
 		};
 	}
-
+	private String generateDefaultIssueDescription(Map<String, Object> issue) {
+		String issueType = (String) issue.get("type");
+		String severity = (String) issue.get("severity");
+		String category = (String) issue.get("category");
+		
+		if ("security".equalsIgnoreCase(category)) {
+			return switch (issueType.toUpperCase()) {
+				case "SQL_INJECTION" -> "SQL Injection occurs when untrusted data is concatenated directly into SQL queries, allowing attackers to modify the query structure. This can lead to unauthorized data access, data manipulation, or even complete database compromise.";
+				case "XSS", "CROSS_SITE_SCRIPTING" -> "Cross-Site Scripting (XSS) vulnerabilities occur when user input is rendered in HTML without proper encoding, allowing attackers to inject malicious scripts. These scripts can steal user credentials, hijack sessions, or perform actions on behalf of the victim.";
+				case "HARDCODED_CREDENTIALS" -> "Hardcoded credentials in source code pose a serious security risk as they can be easily discovered by anyone with access to the codebase. This vulnerability can lead to unauthorized system access and data breaches, especially if the code is shared or becomes public.";
+				case "PATH_TRAVERSAL" -> "Path Traversal vulnerabilities allow attackers to access files outside the intended directory by manipulating file paths. This can expose sensitive configuration files, source code, or system files, leading to information disclosure or system compromise.";
+				case "INSECURE_DESERIALIZATION" -> "Insecure deserialization occurs when untrusted data is deserialized without proper validation, potentially allowing arbitrary code execution. Attackers can craft malicious serialized objects that execute commands when deserialized by the application.";
+				case "AUTHENTICATION_FLAW" -> "Authentication flaws allow attackers to bypass login mechanisms or impersonate other users. This can occur due to weak session management, predictable tokens, or improper credential validation, leading to unauthorized access to user accounts.";
+				case "CRYPTOGRAPHIC_WEAKNESS" -> "Weak cryptographic implementations, such as using outdated algorithms or improper key management, can be exploited to decrypt sensitive data. This vulnerability compromises data confidentiality and can lead to exposure of passwords, personal information, or business secrets.";
+				default -> "This security vulnerability in the code can be exploited by attackers to compromise application security. It requires immediate attention to prevent potential security breaches and protect sensitive data.";
+			};
+		} else if ("performance".equalsIgnoreCase(category)) {
+			return switch (issueType.toUpperCase()) {
+				case "INEFFICIENT_LOOP" -> "This loop implementation has performance issues that can cause excessive CPU usage and slow response times. The inefficiency typically stems from nested loops with high complexity or unnecessary repeated operations that could be optimized.";
+				case "BLOCKING_IO", "BLOCKING_IO_OPERATION" -> "Blocking I/O operations can freeze the application thread while waiting for external resources, leading to poor responsiveness. This impacts user experience and reduces the application's ability to handle concurrent requests efficiently.";
+				case "MEMORY_LEAK", "POTENTIAL_MEMORY_LEAK" -> "Memory leaks occur when objects are retained in memory unnecessarily, causing gradual memory exhaustion. This can lead to application crashes, degraded performance over time, and increased infrastructure costs.";
+				case "INEFFICIENT_DATABASE_QUERY" -> "Inefficient database queries can cause significant performance bottlenecks, especially with large datasets. This results in slow page loads, increased database server load, and poor application scalability.";
+				case "UNNECESSARY_LOOP" -> "Unnecessary loops perform redundant iterations that waste computational resources. This inefficiency impacts application performance and can be eliminated through better algorithm design or data structure choices.";
+				default -> "This performance issue impacts application efficiency and user experience. Optimizing this code will improve response times, reduce resource consumption, and enhance overall application scalability.";
+			};
+		} else {
+			return switch (issueType.toUpperCase()) {
+				case "CODE_DUPLICATION" -> "Code duplication violates the DRY (Don't Repeat Yourself) principle, making maintenance difficult and error-prone. When the same logic exists in multiple places, bugs must be fixed in each location, increasing the risk of inconsistencies.";
+				case "HIGH_CYCLOMATIC_COMPLEXITY" -> "High cyclomatic complexity indicates overly complex code with many decision paths, making it difficult to understand and test. This complexity increases the likelihood of bugs and makes the code harder to maintain or modify.";
+				case "MISSING_ERROR_HANDLING" -> "Missing error handling can cause applications to crash unexpectedly or behave unpredictably when errors occur. Proper error handling ensures graceful degradation and provides meaningful feedback for debugging and user experience.";
+				case "CODE_SMELL" -> "Code smells indicate deeper problems in the code structure that, while not bugs, suggest areas needing refactoring. These issues make the code harder to understand, modify, and maintain over time.";
+				case "LACK_OF_DOCUMENTATION" -> "Lack of documentation makes code difficult to understand and maintain, especially for new team members. Well-documented code reduces onboarding time and prevents misunderstandings about code functionality and design decisions.";
+				default -> "This code quality issue affects maintainability and reliability of the application. Addressing it will improve code readability, reduce technical debt, and make future development more efficient.";
+			};
+		}
+	}
+	
 	private String getIssueTypeExplanation(String issueType) {
 		return switch (issueType.toUpperCase()) {
 		case "SQL_INJECTION" -> "Use prepared statements to prevent SQL injection attacks.";
