@@ -201,8 +201,20 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 				    Thread.sleep(delay);
 				}
 
-				// Switch to sequential processing for Nova API stability
-				BatchResult batchResult = processIssuesSequentially(batch, context, logger);
+				// Check if issues are already categorized (from balanced allocation)
+				boolean hasCategoryInfo = batch.stream().anyMatch(issue -> issue.containsKey("category"));
+
+				BatchResult batchResult;
+				if (hasCategoryInfo) {
+				    // Use category-aware processing for balanced allocation
+				    List<DeveloperSuggestion> suggestions = processCategoryAwareIssues(batch, context, logger);
+				    batchResult = new BatchResult(suggestions, 
+				                                 suggestions.stream().mapToInt(DeveloperSuggestion::getTokensUsed).sum(),
+				                                 suggestions.stream().mapToDouble(DeveloperSuggestion::getCost).sum());
+				} else {
+				    // Fallback to sequential processing
+				    batchResult = processIssuesSequentially(batch, context, logger);
+				}
 
 				// Aggregate results
 				allSuggestions.addAll(batchResult.suggestions);
@@ -263,6 +275,582 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 			return SuggestionResponse.error(request.getAnalysisId(), request.getSessionId(),
 					"Failed to generate suggestions: " + e.getMessage());
 		}
+	}
+	
+	/**
+	 * Process issues with category-aware prioritization
+	 * Ensures balanced token usage across Security, Performance, and Quality
+	 */
+	private List<DeveloperSuggestion> processCategoryAwareIssues(List<Map<String, Object>> issues, 
+	                                                           Context context, LambdaLogger logger) {
+	    logger.log("🎯 Starting category-aware processing for " + issues.size() + " issues");
+	    
+	    // Group issues by category for balanced processing
+	    Map<String, List<Map<String, Object>>> categorizedIssues = issues.stream()
+	            .collect(Collectors.groupingBy(issue -> 
+	                    (String) issue.getOrDefault("category", "quality")));
+	    
+	    List<DeveloperSuggestion> allSuggestions = new ArrayList<>();
+	    int totalTokensUsed = 0;
+	    double totalCost = 0.0;
+	    
+	    // Process each category with appropriate token allocation
+	    for (Map.Entry<String, List<Map<String, Object>>> entry : categorizedIssues.entrySet()) {
+	        String category = entry.getKey();
+	        List<Map<String, Object>> categoryIssues = entry.getValue();
+	        
+	        logger.log(String.format("📋 Processing %s category: %d issues", category, categoryIssues.size()));
+	        
+	        // Calculate token budget for this category
+	        int categoryTokenBudget = calculateCategoryTokenBudget(category, categoryIssues.size());
+	        
+	        // Process category issues sequentially with budget control
+	        CategoryResult categoryResult = processCategoryIssues(categoryIssues, category, 
+	                categoryTokenBudget, context, logger);
+	        
+	        allSuggestions.addAll(categoryResult.suggestions);
+	        totalTokensUsed += categoryResult.tokensUsed;
+	        totalCost += categoryResult.cost;
+	        
+	        logger.log(String.format("✅ %s category complete: %d suggestions, %d tokens, $%.4f", 
+	                category, categoryResult.suggestions.size(), categoryResult.tokensUsed, categoryResult.cost));
+	        
+	        // Check overall budget
+	        if (totalTokensUsed > (TOKEN_BUDGET - TOKEN_BUFFER)) {
+	            logger.log(String.format("🪙 Token budget limit reached (%d/%d), stopping processing", 
+	                    totalTokensUsed, TOKEN_BUDGET));
+	            break;
+	        }
+	    }
+	    
+	    logger.log(String.format("🎉 Category-aware processing complete: %d suggestions, %d tokens, $%.4f", 
+	            allSuggestions.size(), totalTokensUsed, totalCost));
+	    
+	    return allSuggestions;
+	}
+
+	/**
+	 * Calculate token budget allocation per category
+	 */
+	private int calculateCategoryTokenBudget(String category, int issueCount) {
+	    // Base allocation percentages
+	    double allocation = switch (category.toLowerCase()) {
+	        case "security" -> 0.50;      // 50% of budget
+	        case "performance" -> 0.30;   // 30% of budget  
+	        case "quality" -> 0.20;       // 20% of budget
+	        default -> 0.20;              // Default to quality allocation
+	    };
+	    
+	    int categoryBudget = (int) ((TOKEN_BUDGET - TOKEN_BUFFER) * allocation);
+	    
+	    // Ensure minimum budget per issue (at least 2000 tokens per suggestion)
+	    int minBudgetNeeded = issueCount * 2000;
+	    
+	    return Math.max(categoryBudget, Math.min(minBudgetNeeded, TOKEN_BUDGET / 3));
+	}
+
+	/**
+	 * Process issues within a single category
+	 */
+	private CategoryResult processCategoryIssues(List<Map<String, Object>> issues, String category,
+	                                           int tokenBudget, Context context, LambdaLogger logger) {
+	    List<DeveloperSuggestion> suggestions = new ArrayList<>();
+	    int tokensUsed = 0;
+	    double cost = 0.0;
+	    
+	    // Sort issues by priority within category (CRITICAL/HIGH first)
+	    List<Map<String, Object>> prioritizedIssues = issues.stream()
+	            .sorted((a, b) -> {
+	                String severityA = (String) a.getOrDefault("severity", "LOW");
+	                String severityB = (String) b.getOrDefault("severity", "LOW");
+	                return getSeverityPriority(severityB) - getSeverityPriority(severityA);
+	            })
+	            .collect(Collectors.toList());
+	    
+	    for (int i = 0; i < prioritizedIssues.size(); i++) {
+	        Map<String, Object> issue = prioritizedIssues.get(i);
+	        
+	        // Check token budget
+	        if (tokensUsed >= tokenBudget) {
+	            logger.log(String.format("💰 %s category budget exhausted (%d/%d tokens)", 
+	                    category, tokensUsed, tokenBudget));
+	            break;
+	        }
+	        
+	        try {
+	            // Generate suggestion with category-specific optimization
+	            DeveloperSuggestion suggestion = generateCategoryOptimizedSuggestion(issue, category, logger);
+	            
+	            if (suggestion != null) {
+	                suggestions.add(suggestion);
+	                tokensUsed += suggestion.getTokensUsed();
+	                cost += suggestion.getCost();
+	                
+	                logger.log(String.format("✅ %s suggestion generated: %s (tokens: %d)", 
+	                        category, issue.get("id"), suggestion.getTokensUsed()));
+	            }
+	            
+	        } catch (Exception e) {
+	            logger.log(String.format("❌ Error generating %s suggestion for %s: %s", 
+	                    category, issue.get("id"), e.getMessage()));
+	        }
+	        
+	        // Add delay between suggestions to prevent throttling
+	        if (i < prioritizedIssues.size() - 1) {
+	            try {
+	                Thread.sleep(1000); // 1 second delay
+	            } catch (InterruptedException e) {
+	                Thread.currentThread().interrupt();
+	                break;
+	            }
+	        }
+	    }
+	    
+	    return new CategoryResult(suggestions, tokensUsed, cost);
+	}
+
+	/**
+	 * Generate category-optimized suggestion
+	 */
+	private DeveloperSuggestion generateCategoryOptimizedSuggestion(Map<String, Object> issue, 
+	                                                              String category, LambdaLogger logger) {
+	    try {
+	        String issueId = (String) issue.get("id");
+	        String severity = (String) issue.getOrDefault("severity", "MEDIUM");
+	        
+	        // Determine model based on category and severity
+	        String selectedModel = determineCategoryAwareModel(category, severity);
+	        
+	        // Build category-specific prompt
+	        String prompt = buildCategoryOptimizedPrompt(issue, category);
+	        
+	        // Optimize token usage for category
+	        int maxTokens = calculateCategoryMaxTokens(category, severity);
+	        
+	        logger.log(String.format("🔍 Generating %s suggestion for %s using %s (max tokens: %d)", 
+	                category, issueId, selectedModel, maxTokens));
+	        
+	        // Generate suggestion with correct method signature
+	        NovaInvokerService.NovaResponse novaResponse;
+	        if ("TEMPLATE_MODE".equals(selectedModel)) {
+	            novaResponse = createCategoryTemplateResponse(prompt, category, maxTokens);
+	        } else {
+	            // Use the correct method signature
+	            novaResponse = novaInvoker.invokeNova(selectedModel, prompt, maxTokens, 0.3, 0.9);
+	        }
+	        
+	        // Parse and return suggestion
+	        return parseSuggestionResponse(novaResponse, issue, category);
+	        
+	    } catch (Exception e) {
+	        logger.log("❌ Error in category-optimized suggestion generation: " + e.getMessage());
+	        return null;
+	    }
+	}
+
+	/**
+	 * Determine model based on category and severity
+	 */
+	private String determineCategoryAwareModel(String category, String severity) {
+	    boolean isHighPriority = "CRITICAL".equalsIgnoreCase(severity) || "HIGH".equalsIgnoreCase(severity);
+	    
+	    return switch (category.toLowerCase()) {
+	        case "security" -> isHighPriority ? "amazon.nova-premier-v1:0" : "amazon.nova-lite-v1:0";
+	        case "performance" -> isHighPriority ? "amazon.nova-premier-v1:0" : "amazon.nova-lite-v1:0";
+	        case "quality" -> isHighPriority ? "amazon.nova-lite-v1:0" : "TEMPLATE_MODE";
+	        default -> "TEMPLATE_MODE";
+	    };
+	}
+
+	/**
+	 * Calculate max tokens per category
+	 */
+	private int calculateCategoryMaxTokens(String category, String severity) {
+	    boolean isHighPriority = "CRITICAL".equalsIgnoreCase(severity) || "HIGH".equalsIgnoreCase(severity);
+	    
+	    return switch (category.toLowerCase()) {
+	        case "security" -> isHighPriority ? 4000 : 3000;
+	        case "performance" -> isHighPriority ? 3500 : 2500;  
+	        case "quality" -> isHighPriority ? 2500 : 1500;
+	        default -> 1500;
+	    };
+	}
+
+	/**
+	 * Build category-optimized prompt for specific categories
+	 */
+	private String buildCategoryOptimizedPrompt(Map<String, Object> issue, String category) {
+	    StringBuilder prompt = new StringBuilder();
+
+	    String language = (String) issue.get("language");
+	    String type = (String) issue.get("type");
+	    String severity = (String) issue.get("severity");
+	    String codeSnippet = (String) issue.get("codeSnippet");
+	    String description = (String) issue.get("description");
+
+	    // Category-specific prompt optimization
+	    switch (category.toLowerCase()) {
+	        case "security":
+	            prompt.append("# SECURITY FIX REQUIRED for ").append(type).append(" (").append(severity).append(")\n\n");
+	            prompt.append("🔒 PRIORITY: Immediate security remediation needed\n");
+	            prompt.append("Language: ").append(language).append("\n");
+	            prompt.append("Vulnerability: ").append(description).append("\n\n");
+	            break;
+	            
+	        case "performance":
+	            prompt.append("# PERFORMANCE OPTIMIZATION for ").append(type).append(" (").append(severity).append(")\n\n");
+	            prompt.append("⚡ PRIORITY: Performance improvement required\n");
+	            prompt.append("Language: ").append(language).append("\n");
+	            prompt.append("Issue: ").append(description).append("\n\n");
+	            break;
+	            
+	        case "quality":
+	            prompt.append("# CODE QUALITY IMPROVEMENT for ").append(type).append(" (").append(severity).append(")\n\n");
+	            prompt.append("✨ PRIORITY: Code maintainability enhancement\n");
+	            prompt.append("Language: ").append(language).append("\n");
+	            prompt.append("Issue: ").append(description).append("\n\n");
+	            break;
+	            
+	        default:
+	            return buildSuggestionPrompt(issue); // Fallback to existing method
+	    }
+
+	    prompt.append("Code:\n```").append(language != null ? language.toLowerCase() : "text").append("\n");
+	    prompt.append(TokenOptimizer.truncateCode(codeSnippet, 500)).append("\n");
+	    prompt.append("```\n\n");
+
+	    // Category-specific JSON structure request
+	    if ("security".equals(category.toLowerCase())) {
+	        prompt.append("Generate SECURITY-FOCUSED fix as JSON with emphasis on vulnerability mitigation:\n");
+	    } else if ("performance".equals(category.toLowerCase())) {
+	        prompt.append("Generate PERFORMANCE-FOCUSED optimization as JSON with metrics and benchmarks:\n");
+	    } else {
+	        prompt.append("Generate QUALITY-FOCUSED improvement as JSON with maintainability focus:\n");
+	    }
+
+	    prompt.append("```json\n{\n");
+	    prompt.append("  \"immediateFix\": {\n");
+	    prompt.append("    \"title\": \"Brief description\",\n");
+	    prompt.append("    \"searchCode\": \"Exact problematic code\",\n");
+	    prompt.append("    \"replaceCode\": \"Fixed code\",\n");
+	    prompt.append("    \"explanation\": \"Why this fixes the issue\"\n");
+	    prompt.append("  },\n");
+	    prompt.append("  \"bestPractice\": {\n");
+	    prompt.append("    \"title\": \"Best practice name\",\n");
+	    prompt.append("    \"code\": \"Example implementation\",\n");
+	    prompt.append("    \"benefits\": [\"Benefit 1\", \"Benefit 2\"]\n");
+	    prompt.append("  },\n");
+	    prompt.append("  \"testing\": {\n");
+	    prompt.append("    \"testCase\": \"Unit test code\",\n");
+	    prompt.append("    \"validationSteps\": [\"Step 1\", \"Step 2\"]\n");
+	    prompt.append("  },\n");
+	    prompt.append("  \"prevention\": {\n");
+	    prompt.append("    \"guidelines\": [\"Guideline 1\", \"Guideline 2\"],\n");
+	    prompt.append("    \"tools\": [{\"name\": \"Tool\", \"description\": \"How it helps\"}],\n");
+	    prompt.append("    \"codeReviewChecklist\": [\"Check 1\", \"Check 2\"]\n");
+	    prompt.append("  }\n");
+	    prompt.append("}\n```");
+
+	    return prompt.toString();
+	}
+
+	/**
+	 * Create category-specific template response
+	 */
+	private NovaInvokerService.NovaResponse createCategoryTemplateResponse(String prompt, String category, int maxTokens) {
+	    String templateResponse = generateCategoryTemplateBasedSuggestion(prompt, category);
+	    
+	    // Create response object using builder pattern
+	    return NovaInvokerService.NovaResponse.builder()
+	        .responseText(templateResponse)
+	        .inputTokens(50)
+	        .outputTokens(150)
+	        .totalTokens(200)
+	        .estimatedCost(0.0002)
+	        .modelId("TEMPLATE_MODE_" + category.toUpperCase())
+	        .successful(true)
+	        .timestamp(System.currentTimeMillis())
+	        .build();
+	}
+
+	/**
+	 * Generate category-specific template-based suggestion
+	 */
+	private String generateCategoryTemplateBasedSuggestion(String prompt, String category) {
+	    String lowerPrompt = prompt.toLowerCase();
+	    
+	    // Security category templates
+	    if ("security".equals(category.toLowerCase())) {
+	        if (lowerPrompt.contains("sql injection") || lowerPrompt.contains("sqli")) {
+	            return """
+	            {
+	              "immediateFix": {
+	                "title": "Use Parameterized Queries",
+	                "searchCode": "String query = \\"SELECT * FROM users WHERE id = '\\" + userId + \\"'\\";",
+	                "replaceCode": "String query = \\"SELECT * FROM users WHERE id = ?\\"; PreparedStatement stmt = connection.prepareStatement(query); stmt.setString(1, userId);",
+	                "explanation": "Parameterized queries prevent SQL injection by separating code from data."
+	              },
+	              "bestPractice": {
+	                "title": "Always Use Prepared Statements",
+	                "code": "PreparedStatement stmt = connection.prepareStatement(\\"SELECT * FROM users WHERE id = ?\\"); stmt.setString(1, userId);",
+	                "benefits": ["Prevents SQL injection", "Better performance", "Cleaner code"]
+	              },
+	              "testing": {
+	                "testCase": "@Test public void testSqlInjectionPrevention() { String maliciousInput = \\"'; DROP TABLE users; --\\"; /* Test should not affect database */ }",
+	                "validationSteps": ["Test with malicious input", "Verify database integrity", "Check query logs"]
+	              },
+	              "prevention": {
+	                "guidelines": ["Always use parameterized queries", "Validate input length and format", "Use least privilege database accounts"],
+	                "tools": [{"name": "SonarQube", "description": "Static analysis for SQL injection detection"}],
+	                "codeReviewChecklist": ["Check for string concatenation in SQL", "Verify parameterized queries usage", "Review input validation"]
+	              }
+	            }
+	            """;
+	        } else if (lowerPrompt.contains("xss") || lowerPrompt.contains("cross-site")) {
+	            return """
+	            {
+	              "immediateFix": {
+	                "title": "Implement Input Validation and Output Encoding",
+	                "searchCode": "output.innerHTML = userInput;",
+	                "replaceCode": "output.textContent = sanitizeInput(userInput);",
+	                "explanation": "Use textContent instead of innerHTML and sanitize all user inputs to prevent XSS attacks."
+	              },
+	              "bestPractice": {
+	                "title": "Content Security Policy and Input Sanitization",
+	                "code": "response.setHeader(\\"Content-Security-Policy\\", \\"default-src 'self'\\"); String safeOutput = StringEscapeUtils.escapeHtml4(userInput);",
+	                "benefits": ["Prevents XSS attacks", "Better security posture", "Compliance with security standards"]
+	              },
+	              "testing": {
+	                "testCase": "@Test public void testXSSPrevention() { String maliciousScript = \\"<script>alert('XSS')</script>\\"; /* Test should not execute script */ }",
+	                "validationSteps": ["Test with script tags", "Verify output encoding", "Check CSP headers"]
+	              },
+	              "prevention": {
+	                "guidelines": ["Always encode output", "Validate and sanitize input", "Use Content Security Policy"],
+	                "tools": [{"name": "OWASP ZAP", "description": "Security testing for XSS vulnerabilities"}],
+	                "codeReviewChecklist": ["Check for innerHTML usage", "Verify input sanitization", "Review CSP implementation"]
+	              }
+	            }
+	            """;
+	        }
+	        // Default security template
+	        return createDefaultSecurityTemplate();
+	    }
+	    
+	    // Performance category templates
+	    else if ("performance".equals(category.toLowerCase())) {
+	        if (lowerPrompt.contains("loop") || lowerPrompt.contains("complexity")) {
+	            return """
+	            {
+	              "immediateFix": {
+	                "title": "Optimize Algorithm Complexity",
+	                "searchCode": "for(int i=0; i<n; i++) { for(int j=0; j<n; j++) { /* O(n²) operation */ } }",
+	                "replaceCode": "// Use HashMap for O(1) lookup instead of nested loops\\nMap<String, Object> lookupMap = new HashMap<>();",
+	                "explanation": "Replace nested loops with more efficient data structures to reduce time complexity from O(n²) to O(n)."
+	              },
+	              "bestPractice": {
+	                "title": "Choose Appropriate Data Structures",
+	                "code": "// Use HashSet for O(1) contains() instead of ArrayList O(n)\\nSet<String> items = new HashSet<>(Arrays.asList(data));",
+	                "benefits": ["Faster execution", "Better scalability", "Reduced CPU usage"]
+	              },
+	              "testing": {
+	                "testCase": "@Test public void testPerformanceImprovement() { /* Benchmark before and after optimization */ }",
+	                "validationSteps": ["Measure execution time", "Profile memory usage", "Test with large datasets"]
+	              },
+	              "prevention": {
+	                "guidelines": ["Analyze algorithm complexity", "Use profiling tools", "Consider data structure efficiency"],
+	                "tools": [{"name": "JProfiler", "description": "Performance profiling and optimization"}],
+	                "codeReviewChecklist": ["Check algorithm complexity", "Review data structure choices", "Verify performance tests"]
+	              }
+	            }
+	            """;
+	        }
+	        // Default performance template
+	        return createDefaultPerformanceTemplate();
+	    }
+	    
+	    // Quality category templates
+	    else if ("quality".equals(category.toLowerCase())) {
+	        if (lowerPrompt.contains("cyclomatic") || lowerPrompt.contains("complexity")) {
+	            return """
+	            {
+	              "immediateFix": {
+	                "title": "Extract Method to Reduce Complexity",
+	                "searchCode": "public void complexMethod() { /* 20+ lines of complex logic */ }",
+	                "replaceCode": "public void complexMethod() { validateInput(); processData(); generateOutput(); }\\nprivate void validateInput() { /* validation logic */ }",
+	                "explanation": "Break down complex methods into smaller, focused methods to improve readability and maintainability."
+	              },
+	              "bestPractice": {
+	                "title": "Single Responsibility Principle",
+	                "code": "// Each method should have one clear responsibility\\npublic class UserService { public void createUser() { /* only user creation */ } }",
+	                "benefits": ["Better maintainability", "Easier testing", "Improved code clarity"]
+	              },
+	              "testing": {
+	                "testCase": "@Test public void testEachMethodSeparately() { /* Test individual methods */ }",
+	                "validationSteps": ["Test each extracted method", "Verify overall functionality", "Check code coverage"]
+	              },
+	              "prevention": {
+	                "guidelines": ["Keep methods focused", "Limit cyclomatic complexity", "Use design patterns appropriately"],
+	                "tools": [{"name": "SonarQube", "description": "Code quality and complexity analysis"}],
+	                "codeReviewChecklist": ["Check method length", "Verify single responsibility", "Review complexity metrics"]
+	              }
+	            }
+	            """;
+	        }
+	        // Default quality template
+	        return createDefaultQualityTemplate();
+	    }
+	    
+	    // Fallback template
+	    return createFallbackJsonResponse("Template mode for " + category);
+	}
+
+	/**
+	 * Parse suggestion response with corrected signature matching existing project
+	 */
+	private DeveloperSuggestion parseSuggestionResponse(NovaInvokerService.NovaResponse novaResponse, 
+	                                                   Map<String, Object> originalIssue, String category) {
+	    try {
+	        String issueId = (String) originalIssue.get("id");
+	        String response = novaResponse.getResponseText();
+	        int tokensUsed = novaResponse.getTotalTokens();
+	        double cost = novaResponse.getEstimatedCost();
+	        String modelUsed = novaResponse.getModelId();
+	        
+	        // Extract JSON from response
+	        String jsonContent = extractJsonFromResponse(response);
+	        Map<String, Object> suggestionData = objectMapper.readValue(jsonContent, Map.class);
+
+	        return DeveloperSuggestion.builder()
+	                .issueId(issueId)
+	                .issueType((String) originalIssue.get("type"))
+	                .issueCategory(category) // Use the category parameter
+	                .issueSeverity((String) originalIssue.get("severity"))
+	                .language((String) originalIssue.get("language"))
+	                .immediateFix(parseImmediateFix(suggestionData))
+	                .bestPractice(parseBestPractice(suggestionData))
+	                .testing(parseTesting(suggestionData))
+	                .prevention(parsePrevention(suggestionData))
+	                .tokensUsed(tokensUsed)
+	                .cost(cost)
+	                .timestamp(System.currentTimeMillis())
+	                .modelUsed(modelUsed)
+	                .build();
+
+	    } catch (Exception e) {
+	        log.error("❌ Error parsing suggestion response for issue {}: {}", originalIssue.get("id"), e.getMessage());
+	        return createFallbackSuggestion((String) originalIssue.get("id"), originalIssue, 
+	                                      novaResponse.getTotalTokens(), novaResponse.getEstimatedCost());
+	    }
+	}
+
+	// Helper methods for default templates
+	private String createDefaultSecurityTemplate() {
+	    return """
+	    {
+	      "immediateFix": {
+	        "title": "Security Review Required",
+	        "searchCode": "Review the identified security vulnerability",
+	        "replaceCode": "Apply appropriate security measures according to OWASP guidelines",
+	        "explanation": "This security issue requires manual review and implementation of appropriate security controls."
+	      },
+	      "bestPractice": {
+	        "title": "Follow OWASP Security Guidelines",
+	        "code": "// Implement security controls according to OWASP Top 10\\n// Use security frameworks and libraries",
+	        "benefits": ["Improved security posture", "Compliance with standards", "Reduced vulnerability risk"]
+	      },
+	      "testing": {
+	        "testCase": "// Add security-focused unit tests and integration tests",
+	        "validationSteps": ["Security code review", "Penetration testing", "Vulnerability scanning"]
+	      },
+	      "prevention": {
+	        "guidelines": ["Follow secure coding practices", "Regular security training", "Use security linters"],
+	        "tools": [{"name": "OWASP ZAP", "description": "Security vulnerability scanner"}],
+	        "codeReviewChecklist": ["Security implications", "Input validation", "Authentication and authorization"]
+	      }
+	    }
+	    """;
+	}
+
+	private String createDefaultPerformanceTemplate() {
+	    return """
+	    {
+	      "immediateFix": {
+	        "title": "Performance Optimization Required",
+	        "searchCode": "Review the identified performance bottleneck",
+	        "replaceCode": "Apply performance optimization techniques",
+	        "explanation": "This performance issue requires analysis and optimization of the identified code section."
+	      },
+	      "bestPractice": {
+	        "title": "Performance Best Practices",
+	        "code": "// Use efficient algorithms and data structures\\n// Profile and measure performance improvements",
+	        "benefits": ["Faster execution", "Better user experience", "Reduced resource consumption"]
+	      },
+	      "testing": {
+	        "testCase": "// Add performance benchmarks and load tests",
+	        "validationSteps": ["Performance profiling", "Load testing", "Memory usage analysis"]
+	      },
+	      "prevention": {
+	        "guidelines": ["Profile regularly", "Choose efficient algorithms", "Monitor performance metrics"],
+	        "tools": [{"name": "JProfiler", "description": "Performance profiling and analysis"}],
+	        "codeReviewChecklist": ["Algorithm complexity", "Memory usage", "Performance impact"]
+	      }
+	    }
+	    """;
+	}
+
+	private String createDefaultQualityTemplate() {
+	    return """
+	    {
+	      "immediateFix": {
+	        "title": "Code Quality Improvement Required",
+	        "searchCode": "Review the identified code quality issue",
+	        "replaceCode": "Apply code quality best practices and refactoring",
+	        "explanation": "This code quality issue requires refactoring to improve maintainability and readability."
+	      },
+	      "bestPractice": {
+	        "title": "Code Quality Best Practices",
+	        "code": "// Follow SOLID principles\\n// Use meaningful names and clear structure",
+	        "benefits": ["Better maintainability", "Easier debugging", "Improved team productivity"]
+	      },
+	      "testing": {
+	        "testCase": "// Add comprehensive unit tests for refactored code",
+	        "validationSteps": ["Code review", "Test coverage analysis", "Static code analysis"]
+	      },
+	      "prevention": {
+	        "guidelines": ["Follow coding standards", "Regular refactoring", "Use static analysis tools"],
+	        "tools": [{"name": "SonarQube", "description": "Code quality and maintainability analysis"}],
+	        "codeReviewChecklist": ["Code complexity", "Naming conventions", "Design patterns usage"]
+	      }
+	    }
+	    """;
+	}
+
+	/**
+	 * Helper class for category processing results
+	 */
+	private static class CategoryResult {
+	    final List<DeveloperSuggestion> suggestions;
+	    final int tokensUsed;
+	    final double cost;
+	    
+	    CategoryResult(List<DeveloperSuggestion> suggestions, int tokensUsed, double cost) {
+	        this.suggestions = suggestions;
+	        this.tokensUsed = tokensUsed;
+	        this.cost = cost;
+	    }
+	}
+
+	/**
+	 * Get severity priority for sorting
+	 */
+	private int getSeverityPriority(String severity) {
+	    return switch (severity.toUpperCase()) {
+	        case "CRITICAL" -> 4;
+	        case "HIGH" -> 3;
+	        case "MEDIUM" -> 2;
+	        case "LOW" -> 1;
+	        default -> 0;
+	    };
 	}
 	
 	/**
