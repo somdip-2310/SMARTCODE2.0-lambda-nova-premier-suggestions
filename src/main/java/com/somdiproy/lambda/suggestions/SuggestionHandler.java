@@ -452,14 +452,14 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 	 * Determine model based on category and severity
 	 */
 	private String determineCategoryAwareModel(String category, String severity) {
-	    boolean isHighPriority = "CRITICAL".equalsIgnoreCase(severity) || "HIGH".equalsIgnoreCase(severity);
-	    
-	    return switch (category.toLowerCase()) {
-	        case "security" -> isHighPriority ? "amazon.nova-premier-v1:0" : "amazon.nova-lite-v1:0";
-	        case "performance" -> isHighPriority ? "amazon.nova-premier-v1:0" : "amazon.nova-lite-v1:0";
-	        case "quality" -> isHighPriority ? "amazon.nova-lite-v1:0" : "TEMPLATE_MODE";
-	        default -> "TEMPLATE_MODE";
-	    };
+		boolean isHighPriority = "CRITICAL".equalsIgnoreCase(severity) || "HIGH".equalsIgnoreCase(severity);
+
+		return switch (category.toLowerCase()) {
+		case "security" -> isHighPriority ? "amazon.nova-pro-v1:0" : "amazon.nova-lite-v1:0";
+		case "performance" -> isHighPriority ? "amazon.nova-pro-v1:0" : "amazon.nova-lite-v1:0";
+		case "quality" -> isHighPriority ? "amazon.nova-lite-v1:0" : "TEMPLATE_MODE";
+		default -> "TEMPLATE_MODE";
+		};
 	}
 
 	/**
