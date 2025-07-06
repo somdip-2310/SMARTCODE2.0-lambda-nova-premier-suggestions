@@ -170,6 +170,22 @@ public class DynamoDBService {
             item.put("analysisId", AttributeValue.builder().s(analysisId).build());
             item.put("issueId", AttributeValue.builder().s(suggestion.getIssueId()).build());
             
+            // Store issue metadata
+            if (suggestion.getIssueType() != null) {
+                item.put("type", AttributeValue.builder().s(suggestion.getIssueType()).build());
+            }
+            if (suggestion.getIssueSeverity() != null) {
+                item.put("severity", AttributeValue.builder().s(suggestion.getIssueSeverity()).build());
+            }
+            if (suggestion.getIssueCategory() != null) {
+                item.put("category", AttributeValue.builder().s(suggestion.getIssueCategory()).build());
+            }
+            
+            // Generate title from type if not present
+            String title = suggestion.getIssueType() != null ? 
+                suggestion.getIssueType().replace("_", " ") : "Unknown Issue";
+            item.put("title", AttributeValue.builder().s(title).build());
+            
             // Store suggestion data in the format expected by main app
             if (suggestion.getImmediateFix() != null) {
                 Map<String, AttributeValue> immediateFix = new HashMap<>();
