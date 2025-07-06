@@ -532,7 +532,7 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 	    }
 	    
 	    prompt.append("```json\n{\n");
-	    prompt.append("  \"issueDescription\": \"Detailed explanation of what this ").append(type).append(" issue is, how it can be exploited/cause problems, and its potential impact (2-3 sentences)\",\n");
+	    prompt.append("  \"issueDescription\": \"REQUIRED - Must be 2-3 complete sentences. First: What is this ").append(type).append(" issue. Second: How it can be exploited or cause problems. Third: The potential impact on the system. DO NOT leave this field empty or generic.\",\n");
 	    prompt.append("  \"immediateFix\": {\n");
 	    prompt.append("    \"title\": \"Brief description\",\n");
 	    prompt.append("    \"searchCode\": \"Exact problematic code\",\n");
@@ -1220,12 +1220,22 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 			// Extract JSON from response
 			String jsonContent = extractJsonFromResponse(response);
 			Map<String, Object> suggestionData = objectMapper.readValue(jsonContent, Map.class);
+			
+			// Validate and ensure issueDescription exists
+			String issueDescription = (String) suggestionData.get("issueDescription");
+			if (issueDescription == null || issueDescription.trim().isEmpty() || 
+			    issueDescription.length() < 50) { // Ensure meaningful description
+			    
+			    // Use the existing generateDefaultIssueDescription method
+			    issueDescription = generateDefaultIssueDescription(originalIssue);
+			    suggestionData.put("issueDescription", issueDescription);
+			}
 
 			return DeveloperSuggestion.builder().issueId(issueId).issueType((String) originalIssue.get("type"))
 					.issueCategory((String) originalIssue.get("category"))
 					.issueSeverity((String) originalIssue.get("severity"))
 					.language((String) originalIssue.get("language"))
-					.issueDescription((String) suggestionData.getOrDefault("issueDescription", generateDefaultIssueDescription(originalIssue)))
+					.issueDescription(issueDescription)
 					.immediateFix(parseImmediateFix(suggestionData))
 					.bestPractice(parseBestPractice(suggestionData)).testing(parseTesting(suggestionData))
 					.prevention(parsePrevention(suggestionData)).tokensUsed(tokensUsed).cost(cost)
@@ -1650,7 +1660,9 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 
 		return DeveloperSuggestion.builder().issueId(issueId).issueType(issueType)
 				.issueCategory((String) issue.get("category")).issueSeverity((String) issue.get("severity"))
-				.language((String) issue.get("language")).immediateFix(fallbackFix).bestPractice(fallbackPractice)
+				.language((String) issue.get("language"))
+				.issueDescription(generateDefaultIssueDescription(issue))
+				.immediateFix(fallbackFix).bestPractice(fallbackPractice)
 				.tokensUsed(tokensUsed).cost(cost).timestamp(System.currentTimeMillis())
 				.modelUsed(DEFAULT_MODEL_ID + "-fallback").build();
 	}
