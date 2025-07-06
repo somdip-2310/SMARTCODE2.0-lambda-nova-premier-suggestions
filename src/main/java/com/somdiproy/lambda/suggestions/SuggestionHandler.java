@@ -736,8 +736,8 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 	                .prevention(parsePrevention(suggestionData))
 	                .tokensUsed(tokensUsed)
 	                .cost(cost)
-	                .file((String) issue.get("file"))
-	                .line(issue.get("line") != null ? Integer.valueOf(issue.get("line").toString()) : null)
+	                .file((String) originalIssue.get("file"))
+                    .line(originalIssue.get("line") != null ? Integer.valueOf(originalIssue.get("line").toString()) : null)
 	                .timestamp(System.currentTimeMillis())
 	                .modelUsed(modelUsed)
 	                .build();
@@ -1240,8 +1240,8 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 					.issueDescription(issueDescription)
 					.immediateFix(parseImmediateFix(suggestionData))
 					.bestPractice(parseBestPractice(suggestionData)).testing(parseTesting(suggestionData))
-					.file((String) issue.get("file"))
-                    .line(issue.get("line") != null ? Integer.valueOf(issue.get("line").toString()) : null)
+					.file((String) originalIssue.get("file"))
+                    .line(originalIssue.get("line") != null ? Integer.valueOf(originalIssue.get("line").toString()) : null)
 					.prevention(parsePrevention(suggestionData)).tokensUsed(tokensUsed).cost(cost)
 					.timestamp(System.currentTimeMillis()).modelUsed(modelUsed).build();
 
