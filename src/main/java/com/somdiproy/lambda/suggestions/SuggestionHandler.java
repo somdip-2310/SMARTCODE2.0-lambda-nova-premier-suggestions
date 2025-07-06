@@ -736,6 +736,8 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 	                .prevention(parsePrevention(suggestionData))
 	                .tokensUsed(tokensUsed)
 	                .cost(cost)
+	                .file((String) issue.get("file"))
+	                .line(issue.get("line") != null ? Integer.valueOf(issue.get("line").toString()) : null)
 	                .timestamp(System.currentTimeMillis())
 	                .modelUsed(modelUsed)
 	                .build();
@@ -1238,6 +1240,8 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 					.issueDescription(issueDescription)
 					.immediateFix(parseImmediateFix(suggestionData))
 					.bestPractice(parseBestPractice(suggestionData)).testing(parseTesting(suggestionData))
+					.file((String) issue.get("file"))
+                    .line(issue.get("line") != null ? Integer.valueOf(issue.get("line").toString()) : null)
 					.prevention(parsePrevention(suggestionData)).tokensUsed(tokensUsed).cost(cost)
 					.timestamp(System.currentTimeMillis()).modelUsed(modelUsed).build();
 
@@ -1663,6 +1667,8 @@ public class SuggestionHandler implements RequestHandler<SuggestionRequest, Sugg
 				.language((String) issue.get("language"))
 				.issueDescription(generateDefaultIssueDescription(issue))
 				.immediateFix(fallbackFix).bestPractice(fallbackPractice)
+				.file((String) issue.get("file"))
+                .line(issue.get("line") != null ? Integer.valueOf(issue.get("line").toString()) : null)
 				.tokensUsed(tokensUsed).cost(cost).timestamp(System.currentTimeMillis())
 				.modelUsed(DEFAULT_MODEL_ID + "-fallback").build();
 	}

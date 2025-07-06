@@ -187,8 +187,9 @@ public class DynamoDBService {
             item.put("title", AttributeValue.builder().s(title).build());
             
             // Store suggestion data in the format expected by main app
+            Map<String, AttributeValue> suggestionMap = new HashMap<>();
+            Map<String, AttributeValue> immediateFix = new HashMap<>();
             if (suggestion.getImmediateFix() != null) {
-                Map<String, AttributeValue> immediateFix = new HashMap<>();
                 immediateFix.put("title", AttributeValue.builder().s(
                     suggestion.getImmediateFix().getTitle() != null ? 
                     suggestion.getImmediateFix().getTitle() : "Fix Required").build());

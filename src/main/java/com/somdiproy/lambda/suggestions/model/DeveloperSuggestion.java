@@ -51,6 +51,14 @@ public class DeveloperSuggestion {
     @JsonProperty("modelUsed")
     private String modelUsed;
     
+    @JsonProperty("file")
+    private String file;
+    
+    @JsonProperty("line")
+    private Integer line;
+    
+    // Constructors
+    
     // Constructors
     public DeveloperSuggestion() {}
     
@@ -69,6 +77,8 @@ public class DeveloperSuggestion {
         this.cost = builder.cost;
         this.timestamp = builder.timestamp;
         this.modelUsed = builder.modelUsed;
+        this.file = builder.file;
+        this.line = builder.line;
     }
     
     public static Builder builder() {
@@ -90,8 +100,10 @@ public class DeveloperSuggestion {
         private Double cost;
         private Long timestamp;
         private String modelUsed;
+        private String file;
+        private Integer line;
         
-        public Builder issueId(String issueId) { this.issueId = issueId; return this; }
+        public Builder issueId(String issueId) {this.issueId = issueId; return this; }
         public Builder issueType(String issueType) { this.issueType = issueType; return this; }
         public Builder issueCategory(String issueCategory) { this.issueCategory = issueCategory; return this; }
         public Builder issueSeverity(String issueSeverity) { this.issueSeverity = issueSeverity; return this; }
@@ -105,6 +117,8 @@ public class DeveloperSuggestion {
         public Builder cost(Double cost) { this.cost = cost; return this; }
         public Builder timestamp(Long timestamp) { this.timestamp = timestamp; return this; }
         public Builder modelUsed(String modelUsed) { this.modelUsed = modelUsed; return this; }
+        public Builder file(String file) { this.file = file; return this; }
+        public Builder line(Integer line) { this.line = line; return this; }
         
         public DeveloperSuggestion build() {
             return new DeveloperSuggestion(this);
@@ -325,4 +339,6 @@ public class DeveloperSuggestion {
     public Double getCost() { return cost; }
     public Long getTimestamp() { return timestamp; }
     public String getModelUsed() { return modelUsed; }
+    public String getFile() { return file; }
+    public Integer getLine() { return line; }
 }
